@@ -34,9 +34,22 @@ API Usage Example
 -----------------
 
     #include <stdio.h>
+    #include <stdlib.h>
     #include <string.h>
+
     #include <cache.h>
     #include <cache_callbacks.h>
+
+    static void value_retain_cb(void *value, void *user_data) {
+        (void)user_data;
+        printf("Value retained: %s\n", (char *)value);
+    }
+
+    static void value_release_cb(void *value, void *user_data) {
+        (void)user_data;
+        printf("Value released: %s\n", (char *)value);
+        free(value);
+    }
 
     int main(void) {
         cache_t *cache = NULL;
@@ -44,7 +57,8 @@ API Usage Example
             .version = CACHE_ATTRIBUTES_VERSION_2,
             .key_hash_cb = cache_key_hash_cb_cstring,
             .key_is_equal_cb = cache_key_is_equal_cb_cstring,
-            .value_release_cb = cache_release_cb_free
+            .value_retain_cb = value_retain_cb,
+            .value_release_cb = value_release_cb
         };
 
         if (cache_create("com.darwin.cache.image_store", &attrs, &cache) != 0) {
