@@ -196,7 +196,8 @@ cache_simulate_memory_warning_event(dispatch_source_memorypressure_flags_t flags
 {
     dispatch_source_memorypressure_flags_t allowed_mask;
 
-    allowed_mask = DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL;
+    allowed_mask = DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN |
+                   DISPATCH_MEMORYPRESSURE_CRITICAL;
 
     if (flags == 0 || (flags & ~allowed_mask) != 0)
         return (EINVAL);
