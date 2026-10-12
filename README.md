@@ -1,0 +1,68 @@
+libcache
+========
+
+An open-source clone of Apple's libcache system library.
+
+Disclaimer: All public APIs (cache.h and cache_callbacks.h) are verified for
+correctness by building and running the unit test suite against Apple's
+libcache implementation. Private APIs (cache_private.h) are implemented on a
+best-effort basis and are not guaranteed to be correct.
+
+Core Features
+-------------
+
+* Lock Striping: Distributes elements across independent shards to minimize
+  multi-threaded lock contention.
+* Kernel Eviction Hooks: Monitors low-priority GCD memory pressure queues to
+  purge unretained nodes under resource strain.
+* Retain/Release Lifecycles: Tracks unpinned elements by reference counts,
+  locking retained entries from eviction.
+* Deterministic Hashing: Provides built-in 64-bit FNV-1a hashing for strings,
+  integers, and fixed byte arrays.
+
+Compilation and Verification
+----------------------------
+
+    mkdir build && cd build
+    cmake ..
+    make
+    export DYLD_LIBRARY_PATH="$(pwd):$DYLD_LIBRARY_PATH"
+    ./cache_unit_tests
+    ./cache_stress --threads 12 --duration 10 --keys 2048 --ballast 32 --zipf --mach-purgeable
+
+API Usage Example
+-----------------
+
+    #include <stdio.h>
+    #include <string.h>
+    #include "cache.h"
+    #include "cache_callbacks.h"
+
+    int main(void) {
+        cache_t *cache = NULL;
+        cache_attributes_t attrs = {
+            .version = CACHE_ATTRIBUTES_VERSION_2,
+            .key_hash_cb = cache_key_hash_cb_cstring,
+            .key_is_equal_cb = cache_key_is_equal_cb_cstring,
+            .value_release_cb = cache_release_cb_free
+        };
+
+        if (cache_create("com.darwin.cache.image_store", &attrs, &cache) != 0) {
+            return 1;
+        }
+
+        char *key = "user_avatar";
+        char *value = strdup("/var/tmp/avatar.png");
+
+        cache_set_and_retain(cache, key, value, 0);
+        cache_release_value(cache, value);
+        cache_destroy(cache);
+
+        return 0;
+    }
+
+License
+-------
+
+Distributed under the BSD 3-Clause License.
+Copyright (c) 2026 Brian McKenzie. All rights reserved.
