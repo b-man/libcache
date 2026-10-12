@@ -70,6 +70,16 @@ To compile and run the example using local headers and `libcache.dylib` from the
     export DYLD_LIBRARY_PATH="build:$DYLD_LIBRARY_PATH"
     ./example
 
+AI Disclosure
+-------------
+
+This library was developed with the assistance of Gemini 3.8 Flash. The AI model was
+utilized throughout the engineering process, assisting with implementation, architecture
+design (including lock striping and LRU queue management), refactoring, test suite
+generation, and documentation. All documentation, implementations, and APIs were
+verified through unit testing and manual review, and only public API documentation from
+Apple was used in the validation process.
+
 License
 -------
 
