@@ -35,8 +35,8 @@ API Usage Example
 
     #include <stdio.h>
     #include <string.h>
-    #include "cache.h"
-    #include "cache_callbacks.h"
+    #include <cache.h>
+    #include <cache_callbacks.h>
 
     int main(void) {
         cache_t *cache = NULL;
@@ -60,6 +60,15 @@ API Usage Example
 
         return 0;
     }
+
+Compiling the Example
+---------------------
+
+To compile and run the example using local headers and `libcache.dylib` from the build directory:
+
+    clang example.c -Iinclude -Lbuild -lcache -o example
+    export DYLD_LIBRARY_PATH="build:$DYLD_LIBRARY_PATH"
+    ./example
 
 License
 -------
