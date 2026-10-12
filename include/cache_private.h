@@ -11,7 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <dispatch/source.h>
 
-#include "cache.h"
+#include <cache.h>
 
 #if defined(CACHE_PRIVATE) && (defined(__GNUC__) || defined(__clang__))
     #define CACHE_PRIVATE_API __attribute__((visibility("default")))

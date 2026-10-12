@@ -9,8 +9,9 @@
 #include <string.h>
 #include <errno.h>
 
-#include "cache.h"
-#include "cache_callbacks.h"
+#include <cache.h>
+#include <cache_callbacks.h>
+
 #include "test_suite.h"
 
 typedef struct {

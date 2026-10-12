@@ -9,8 +9,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "cache.h"
-#include "cache_callbacks.h"
+#include <cache.h>
+#include <cache_callbacks.h>
+
 #include "test_suite.h"
 
 /*
