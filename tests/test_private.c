@@ -407,11 +407,10 @@ test_cache_private_get_and_invoke(void)
 }
 
 /*
- * Validates cache_remove_with_block and cache_simulate_memory_warning_event
- * defined in cache_private.h.
+ * Validates cache_remove_with_block defined in cache_private.h.
  */
 void
-test_cache_private_remove_with_block_and_memory_warning(void)
+test_cache_private_remove_with_block(void)
 {
     cache_t *cache = NULL;
     cache_attributes_t attrs;
@@ -419,7 +418,6 @@ test_cache_private_remove_with_block_and_memory_warning(void)
     void *value_out = NULL;
     int removed_count;
     int status;
-    int i;
 
     memset(&attrs, 0, sizeof(attrs));
     attrs.version = CACHE_ATTRIBUTES_VERSION_2;
@@ -427,7 +425,7 @@ test_cache_private_remove_with_block_and_memory_warning(void)
     attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
     attrs.value_release_cb = cache_release_cb_free;
 
-    status = cache_create("com.darwin.test.private.eviction", &attrs, &cache);
+    status = cache_create("com.darwin.test.private.remove_block", &attrs, &cache);
     ASSERT_TRUE(status == 0 && cache != NULL,
         "cache_create must succeed");
 
@@ -458,6 +456,15 @@ test_cache_private_remove_with_block_and_memory_warning(void)
     ASSERT_TRUE(cache_set_and_retain(cache, "drop_pinned", v_pinned, 40) == 0,
         "Inserting retained drop_pinned must succeed");
 
+    /* Verify cache_remove_with_block removes 0 entries when callback returns false */
+    removed_count = cache_remove_with_block(cache, ^bool(void *key, void *value) {
+        (void)key;
+        (void)value;
+        return false;
+    });
+    ASSERT_TRUE(removed_count == 0,
+        "cache_remove_with_block must return 0 when callback returns false");
+
     /* Remove unretained entries whose key starts with "drop_" */
     removed_count = cache_remove_with_block(cache, ^bool(void *key, void *value) {
         (void)value;
@@ -478,6 +485,145 @@ test_cache_private_remove_with_block_and_memory_warning(void)
     ASSERT_TRUE(cache_get_info(cache, &info) == 0 &&
         info.current_count == 2 && info.current_cost == 70,
         "cache_get_info must report 2 remaining entries with total cost 70");
+
+    ASSERT_TRUE(cache_release_value(cache, v_pinned) == 0,
+        "Releasing drop_pinned must succeed");
+    ASSERT_TRUE(cache_destroy(cache) == 0,
+        "cache_destroy must succeed");
+}
+
+/*
+ * Validates cache_remove_with_block when the predicate callback returns false.
+ */
+void
+test_cache_private_remove_with_block_callback_false(void)
+{
+    cache_t *cache = NULL;
+    cache_attributes_t attrs;
+    cache_info_t info;
+    void *value_out = NULL;
+    int removed_count;
+    int status;
+    __block int callback_invocations = 0;
+
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.version = CACHE_ATTRIBUTES_VERSION_2;
+    attrs.key_hash_cb = cache_key_hash_cb_cstring;
+    attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
+    attrs.value_release_cb = cache_release_cb_free;
+
+    status = cache_create("com.darwin.test.private.remove_block_false", &attrs, &cache);
+    ASSERT_TRUE(status == 0 && cache != NULL,
+        "cache_create must succeed");
+
+    char *v1 = strdup("val_one");
+    char *v2 = strdup("val_two");
+    char *v3 = strdup("val_three");
+    char *v_pinned = strdup("val_pinned");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "entry_1", v1, 10) == 0 &&
+        cache_release_value(cache, v1) == 0,
+        "Inserting unretained entry_1 must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "entry_2", v2, 20) == 0 &&
+        cache_release_value(cache, v2) == 0,
+        "Inserting unretained entry_2 must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "entry_3", v3, 30) == 0 &&
+        cache_release_value(cache, v3) == 0,
+        "Inserting unretained entry_3 must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "entry_pinned", v_pinned, 40) == 0,
+        "Inserting retained entry_pinned must succeed");
+
+    ASSERT_TRUE(cache_get_info(cache, &info) == 0 &&
+        info.current_count == 4 && info.current_cost == 100,
+        "Cache must contain 4 entries with total cost 100 before remove");
+
+    /* When block returns false for all entries */
+    callback_invocations = 0;
+    removed_count = cache_remove_with_block(cache, ^bool(void *key, void *value) {
+        (void)key;
+        (void)value;
+        callback_invocations++;
+        return false;
+    });
+
+    ASSERT_TRUE(removed_count == 0,
+        "cache_remove_with_block must return 0 when block always returns false");
+    ASSERT_TRUE(callback_invocations == 3,
+        "Block must be evaluated for all 3 unretained entries");
+
+    /* Verify all entries remain intact in the cache */
+    ASSERT_TRUE(cache_get(cache, "entry_1", &value_out) == 0 && value_out == v1,
+        "entry_1 must remain in cache when callback returns false");
+    ASSERT_TRUE(cache_get(cache, "entry_2", &value_out) == 0 && value_out == v2,
+        "entry_2 must remain in cache when callback returns false");
+    ASSERT_TRUE(cache_get(cache, "entry_3", &value_out) == 0 && value_out == v3,
+        "entry_3 must remain in cache when callback returns false");
+    ASSERT_TRUE(cache_get(cache, "entry_pinned", &value_out) == 0 && value_out == v_pinned,
+        "entry_pinned must remain in cache when callback returns false");
+
+    ASSERT_TRUE(cache_get_info(cache, &info) == 0 &&
+        info.current_count == 4 && info.current_cost == 100,
+        "Cache entry count and cost must remain unchanged after false predicate");
+
+    /* Verify selective return where false preserves specific entries */
+    removed_count = cache_remove_with_block(cache, ^bool(void *key, void *value) {
+        (void)value;
+        return (strcmp((const char *)key, "entry_1") == 0);
+    });
+
+    ASSERT_TRUE(removed_count == 1,
+        "cache_remove_with_block must remove only entry where predicate was true");
+    ASSERT_TRUE(cache_get(cache, "entry_1", &value_out) == ENOENT,
+        "entry_1 must be removed");
+    ASSERT_TRUE(cache_get(cache, "entry_2", &value_out) == 0 && value_out == v2,
+        "entry_2 must remain since callback returned false");
+    ASSERT_TRUE(cache_get(cache, "entry_3", &value_out) == 0 && value_out == v3,
+        "entry_3 must remain since callback returned false");
+    ASSERT_TRUE(cache_get(cache, "entry_pinned", &value_out) == 0 && value_out == v_pinned,
+        "entry_pinned must remain intact");
+
+    ASSERT_TRUE(cache_release_value(cache, v_pinned) == 0,
+        "Releasing entry_pinned must succeed");
+    ASSERT_TRUE(cache_destroy(cache) == 0,
+        "cache_destroy must succeed");
+}
+
+/*
+ * Validates cache_simulate_memory_warning_event defined in cache_private.h.
+ */
+void
+test_private_simulate_memory_warning(void)
+{
+    cache_t *cache = NULL;
+    cache_attributes_t attrs;
+    cache_info_t info;
+    void *value_out = NULL;
+    int status;
+    int i;
+
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.version = CACHE_ATTRIBUTES_VERSION_2;
+    attrs.key_hash_cb = cache_key_hash_cb_cstring;
+    attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
+    attrs.value_release_cb = cache_release_cb_free;
+
+    status = cache_create("com.darwin.test.private.memory_warning", &attrs, &cache);
+    ASSERT_TRUE(status == 0 && cache != NULL,
+        "cache_create must succeed");
+
+    /* Populate cache with 1 unretained entry and 1 retained entry */
+    char *v_keep = strdup("keep_unretained");
+    char *v_pinned = strdup("drop_retained");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "keep_c", v_keep, 30) == 0 &&
+        cache_release_value(cache, v_keep) == 0,
+        "Inserting unretained keep_c must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "drop_pinned", v_pinned, 40) == 0,
+        "Inserting retained drop_pinned must succeed");
+
+    ASSERT_TRUE(cache_get_info(cache, &info) == 0 &&
+        info.current_count == 2 && info.current_cost == 70,
+        "cache_get_info must report 2 entries with total cost 70 before memory warning");
 
     /* Validate cache_simulate_memory_warning_event error handling and execution */
     ASSERT_TRUE(cache_simulate_memory_warning_event(0) == EINVAL,

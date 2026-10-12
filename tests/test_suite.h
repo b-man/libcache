@@ -51,7 +51,9 @@ void test_cache_scaling_and_integer_keys(void);
 void test_cache_private_name_and_hints(void);
 void test_cache_private_info_and_diagnostics(void);
 void test_cache_private_get_and_invoke(void);
-void test_cache_private_remove_with_block_and_memory_warning(void);
+void test_cache_private_remove_with_block(void);
+void test_cache_private_remove_with_block_callback_false(void);
+void test_private_simulate_memory_warning(void);
 void test_cache_private_release(void);
 void test_cache_private_release_multithreaded(void);
 #endif

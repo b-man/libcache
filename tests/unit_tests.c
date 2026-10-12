@@ -42,7 +42,9 @@ main(void)
     RUN_TEST(test_cache_private_name_and_hints);
     RUN_TEST(test_cache_private_info_and_diagnostics);
     RUN_TEST(test_cache_private_get_and_invoke);
-    RUN_TEST(test_cache_private_remove_with_block_and_memory_warning);
+    RUN_TEST(test_cache_private_remove_with_block);
+    RUN_TEST(test_cache_private_remove_with_block_callback_false);
+    RUN_TEST(test_private_simulate_memory_warning);
     RUN_TEST(test_cache_private_release);
     RUN_TEST(test_cache_private_release_multithreaded);
 #endif
