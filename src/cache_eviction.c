@@ -14,6 +14,51 @@
 #include "cache_internal.h"
 
 /**
+ * @brief Unlinks a cache entry from the key hash table, value-pointer hash
+ *        table, and LRU queue, and updates cache metrics.
+ * @details Caller must hold the stripe lock covering entry->key_hash (or all
+ *          stripe locks) and cache->lru_lock.
+ * @param cache A valid cache instance.
+ * @param entry Entry node to unlink from hash buckets and LRU queue.
+ */
+void
+unlink_entry(cache_t *cache, cache_entry_t *entry)
+{
+    cache_entry_t *curr, *prev;
+
+    if (cache == NULL || entry == NULL)
+        return;
+
+    /* Unlink from the key hash bucket chain */
+    curr = GET_KEY_BUCKET(cache, entry->key_hash);
+    prev = NULL;
+    while (curr != NULL) {
+        if (curr == entry) {
+            if (prev != NULL)
+                prev->next = curr->next;
+            else
+                GET_KEY_BUCKET(cache, entry->key_hash) = curr->next;
+            curr->next = NULL;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+
+    /* Unlink from the doubly linked LRU queue */
+    detach_lru(cache, entry);
+
+    /* Unlink from the value-pointer hash bucket chain */
+    detach_val_bucket(cache, entry);
+
+    /* Update aggregate cost and live entry count */
+    atomic_fetch_sub_explicit(&cache->current_cost, entry->cost,
+        memory_order_relaxed);
+    atomic_fetch_sub_explicit(&cache->current_count, 1,
+        memory_order_relaxed);
+}
+
+/**
  * @brief Invokes configured key and value release callbacks and frees the
  *        entry structure.
  * @param cache A valid cache instance.
@@ -46,8 +91,7 @@ free_entry_resources(cache_t *cache, cache_entry_t *entry)
 int
 _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressure_flags_t flags)
 {
-    cache_entry_t *curr, *next_entry, *prev, *free_head;
-    cache_cost_t removed_cost;
+    cache_entry_t *curr, *next_entry, *free_head;
     size_t b, active_capacity;
 
     if (cache == NULL)
@@ -63,7 +107,6 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
     /* Scan all key buckets for unretained or purgeable entries */
     for (b = 0; b < active_capacity; b++) {
         curr = cache->buckets[b];
-        prev = NULL;
 
         while (curr != NULL) {
             next_entry = curr->next;
@@ -71,20 +114,7 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
             /* Evict unretained entries under warning or critical memory pressure */
             if (curr->retain_count == 0) {
                 if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
-                    if (prev != NULL)
-                        prev->next = next_entry;
-                    else
-                        cache->buckets[b] = next_entry;
-
-                    /* Detach from LRU and value index, update metrics, and queue for freeing */
-                    detach_lru(cache, curr);
-                    detach_val_bucket(cache, curr);
-                    removed_cost = curr->cost;
-                    atomic_fetch_sub_explicit(&cache->current_cost, removed_cost,
-                        memory_order_relaxed);
-                    atomic_fetch_sub_explicit(&cache->current_count, 1,
-                        memory_order_relaxed);
-
+                    unlink_entry(cache, curr);
                     curr->next = free_head;
                     free_head = curr;
                     curr = next_entry;
@@ -99,7 +129,6 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
                     }
                 }
             }
-            prev = curr;
             curr = next_entry;
         }
     }
@@ -186,9 +215,7 @@ _cache_sim_pressure_unenroll(cache_t *cache)
 /**
  * @brief Broadcasts a simulated low-memory event via GCD to trigger cache
  *        memory-pressure handlers.
- * @param flags Non-zero bitmask of memory pressure flags
- *              (DISPATCH_MEMORYPRESSURE_WARN and/or
- *              DISPATCH_MEMORYPRESSURE_CRITICAL).
+ * @param flags Non-zero bitmask of memory pressure flags.
  * @return 0 on success, or EINVAL if flags is 0 or contains unsupported bits.
  */
 CACHE_PRIVATE_API int

@@ -307,7 +307,7 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
 CACHE_PUBLIC_API int
 cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
 {
-    cache_entry_t *entry, *curr, *prev, *tail_node, *replaced_entry;
+    cache_entry_t *entry, *curr, *tail_node, *replaced_entry;
     os_unfair_lock_t stripe_lock, tail_stripe_lock;
     void *key_copy, *value_store, *old_key;
     uintptr_t hash_val, tail_hash_val;
@@ -364,7 +364,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     /* Check if an entry for this key already exists and replace or update it */
     replaced_entry = NULL;
     curr = GET_KEY_BUCKET(cache, hash_val);
-    prev = NULL;
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             if (curr->value == value_store) {
@@ -414,39 +413,28 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                 return (0);
             }
 
-            /* Different value pointer: unlink old entry from key bucket for replacement */
-            if (prev != NULL)
-                prev->next = curr->next;
-            else
-                GET_KEY_BUCKET(cache, hash_val) = curr->next;
+            /* Different value pointer: break to unlink old entry and insert new one */
             break;
         }
-        prev = curr;
         curr = curr->next;
     }
 
-    /* Insert the new entry at the head of its key hash bucket */
-    entry->next = GET_KEY_BUCKET(cache, hash_val);
-    GET_KEY_BUCKET(cache, hash_val) = entry;
-    if (value_store != NULL) {
-        cache_retain(cache);
-    }
-
-    /* Lock LRU once to handle both replacement detach and new entry insertion */
+    /* Lock LRU once to handle both replacement unlinking and new entry insertion */
     cache_lock_lru(cache);
     if (curr != NULL) {
-        detach_lru(cache, curr);
-        detach_val_bucket(cache, curr);
-        atomic_fetch_sub_explicit(&cache->current_cost, curr->cost,
-            memory_order_relaxed);
-        atomic_fetch_sub_explicit(&cache->current_count, 1,
-            memory_order_relaxed);
+        unlink_entry(cache, curr);
         if (curr->retain_count > 0) {
             curr->next = cache->removed_head;
             cache->removed_head = curr;
         } else {
             replaced_entry = curr;
         }
+    }
+    /* Insert the new entry at the head of its key hash bucket */
+    entry->next = GET_KEY_BUCKET(cache, hash_val);
+    GET_KEY_BUCKET(cache, hash_val) = entry;
+    if (value_store != NULL) {
+        cache_retain(cache);
     }
     attach_lru_head(cache, entry);
     attach_val_bucket(cache, entry);
@@ -486,32 +474,12 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
             /* Use trylock to avoid lock-order inversion while holding lru_lock */
             if (os_unfair_lock_trylock(tail_stripe_lock)) {
                 if (tail_node->retain_count == 0) {
-                    curr = GET_KEY_BUCKET(cache, tail_hash_val);
-                    prev = NULL;
-                    
-                    while (curr != NULL) {
-                        if (curr == tail_node) {
-                            if (prev != NULL)
-                                prev->next = curr->next;
-                            else
-                                GET_KEY_BUCKET(cache, tail_hash_val) = curr->next;
+                    unlink_entry(cache, tail_node);
+                    cache_unlock_lru(cache);
+                    os_unfair_lock_unlock(tail_stripe_lock);
 
-                            detach_lru(cache, curr);
-                            detach_val_bucket(cache, curr);
-                            atomic_fetch_sub_explicit(&cache->current_cost,
-                                curr->cost, memory_order_relaxed);
-                            atomic_fetch_sub_explicit(&cache->current_count, 1,
-                                memory_order_relaxed);
-                            
-                            cache_unlock_lru(cache);
-                            os_unfair_lock_unlock(tail_stripe_lock);
-                            
-                            free_entry_resources(cache, curr);
-                            return (0);
-                        }
-                        prev = curr;
-                        curr = curr->next;
-                    }
+                    free_entry_resources(cache, tail_node);
+                    return (0);
                 }
                 os_unfair_lock_unlock(tail_stripe_lock);
             }
@@ -538,7 +506,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
 CACHE_PUBLIC_API int
 cache_get_and_retain(cache_t *cache, void *key, void **value_out)
 {
-    cache_entry_t *curr, *prev;
+    cache_entry_t *curr;
     os_unfair_lock_t stripe_lock;
     uintptr_t hash_val;
 
@@ -552,8 +520,7 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
 
     os_unfair_lock_lock(stripe_lock);
     curr = GET_KEY_BUCKET(cache, hash_val);
-    prev = NULL;
-    
+
     /* Search the bucket chain for a matching key */
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
@@ -563,18 +530,8 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
                     cache->attrs.value_make_nonpurgeable_cb != NULL) {
                     if (!cache->attrs.value_make_nonpurgeable_cb(curr->value,
                         cache->attrs.user_data)) {
-                        if (prev != NULL)
-                            prev->next = curr->next;
-                        else
-                            GET_KEY_BUCKET(cache, hash_val) = curr->next;
-
                         cache_lock_lru(cache);
-                        detach_lru(cache, curr);
-                        detach_val_bucket(cache, curr);
-                        atomic_fetch_sub_explicit(&cache->current_cost, curr->cost,
-                            memory_order_relaxed);
-                        atomic_fetch_sub_explicit(&cache->current_count, 1,
-                            memory_order_relaxed);
+                        unlink_entry(cache, curr);
                         cache_unlock_lru(cache);
                         os_unfair_lock_unlock(stripe_lock);
 
@@ -599,7 +556,6 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
             os_unfair_lock_unlock(stripe_lock);
             return (0);
         }
-        prev = curr;
         curr = curr->next;
     }
     os_unfair_lock_unlock(stripe_lock);
@@ -737,9 +693,8 @@ cache_release_value(cache_t *cache, void *value)
 CACHE_PUBLIC_API int
 cache_remove(cache_t *cache, void *key)
 {
-    cache_entry_t *curr, *prev;
+    cache_entry_t *curr;
     os_unfair_lock_t stripe_lock;
-    cache_cost_t removed_cost;
     uintptr_t hash_val;
 
     if (cache == NULL || key == NULL)
@@ -750,25 +705,11 @@ cache_remove(cache_t *cache, void *key)
 
     os_unfair_lock_lock(stripe_lock);
     curr = GET_KEY_BUCKET(cache, hash_val);
-    prev = NULL;
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
-            
-            /* Unlink the entry from its key hash bucket */
-            if (prev != NULL)
-                prev->next = curr->next;
-            else
-                GET_KEY_BUCKET(cache, hash_val) = curr->next;
-            
-            /* Detach from LRU list and value index, and update aggregate metrics */
+            /* Unlink the entry from hash buckets, LRU queue, and update metrics */
             cache_lock_lru(cache);
-            detach_lru(cache, curr);
-            detach_val_bucket(cache, curr);
-            removed_cost = curr->cost;
-            atomic_fetch_sub_explicit(&cache->current_cost, removed_cost,
-                memory_order_relaxed);
-            atomic_fetch_sub_explicit(&cache->current_count, 1,
-                memory_order_relaxed);
+            unlink_entry(cache, curr);
 
             /* Defer finalization if the entry is still retained by a caller */
             if (curr->retain_count > 0) {
@@ -781,12 +722,11 @@ cache_remove(cache_t *cache, void *key)
 
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
-            
+
             /* Finalize and free the unretained entry outside the locks */
             free_entry_resources(cache, curr);
             return (0);
         }
-        prev = curr;
         curr = curr->next;
     }
     os_unfair_lock_unlock(stripe_lock);
@@ -805,7 +745,7 @@ cache_remove(cache_t *cache, void *key)
 static void
 cache_remove_all_locked(cache_t *cache)
 {
-    cache_entry_t *curr, *next, *free_head, **rem_pp;
+    cache_entry_t *curr, *next, *free_head, **removed_entry_ptr;
 
     free_head = NULL;
 
@@ -827,15 +767,15 @@ cache_remove_all_locked(cache_t *cache)
     }
 
     /* Sweep any unretained entries from removed_head (e.g., cleared during destroy) */
-    rem_pp = &cache->removed_head;
-    while (*rem_pp != NULL) {
-        curr = *rem_pp;
+    removed_entry_ptr = &cache->removed_head;
+    while (*removed_entry_ptr != NULL) {
+        curr = *removed_entry_ptr;
         if (curr->retain_count == 0) {
-            *rem_pp = curr->next;
+            *removed_entry_ptr = curr->next;
             curr->next = free_head;
             free_head = curr;
         } else {
-            rem_pp = &curr->next;
+            removed_entry_ptr = &curr->next;
         }
     }
 
@@ -900,8 +840,7 @@ cache_remove_all(cache_t *cache)
 CACHE_PRIVATE_API int
 cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
 {
-    cache_entry_t *curr, *next_entry, *prev, *free_head;
-    cache_cost_t removed_cost;
+    cache_entry_t *curr, *next_entry, *free_head;
     size_t b, active_capacity;
     int total_removed;
 
@@ -918,7 +857,6 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
     /* Scan all key buckets and evaluate remove_block on unretained entries */
     for (b = 0; b < active_capacity; b++) {
         curr = cache->buckets[b];
-        prev = NULL;
 
         while (curr != NULL) {
             next_entry = curr->next;
@@ -926,25 +864,10 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
             /* Remove unretained entries for which remove_block returns true */
             if (curr->retain_count == 0 &&
                 remove_block(curr->key, curr->value)) {
-                if (prev != NULL)
-                    prev->next = next_entry;
-                else
-                    cache->buckets[b] = next_entry;
-
-                /* Detach from LRU and value index, update metrics, and queue for freeing */
-                detach_lru(cache, curr);
-                detach_val_bucket(cache, curr);
-                removed_cost = curr->cost;
-                atomic_fetch_sub_explicit(&cache->current_cost,
-                    removed_cost, memory_order_relaxed);
-                atomic_fetch_sub_explicit(&cache->current_count, 1,
-                    memory_order_relaxed);
-
+                unlink_entry(cache, curr);
                 curr->next = free_head;
                 free_head = curr;
                 total_removed++;
-            } else {
-                prev = curr;
             }
             curr = next_entry;
         }
