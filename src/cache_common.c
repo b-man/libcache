@@ -307,7 +307,7 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
 CACHE_PUBLIC_API int
 cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
 {
-    cache_entry_t *entry, *curr, *tail_node, *replaced_entry;
+    cache_entry_t *entry, *curr, *tail_node;
     os_unfair_lock_t stripe_lock, tail_stripe_lock;
     void *key_copy, *value_store, *old_key;
     uintptr_t hash_val, tail_hash_val;
@@ -362,7 +362,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     os_unfair_lock_lock(stripe_lock);
 
     /* Check if an entry for this key already exists and replace or update it */
-    replaced_entry = NULL;
     curr = GET_KEY_BUCKET(cache, hash_val);
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
@@ -394,7 +393,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                 }
                 curr->cost = cost;
                 cache_unlock_lru(cache);
-                os_unfair_lock_unlock(stripe_lock);
 
                 malloc_zone_free(cache->memory_zone, entry);
                 if (value_store != NULL &&
@@ -410,6 +408,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                     cache->attrs.key_release_cb(old_key,
                         cache->attrs.user_data);
                 }
+                os_unfair_lock_unlock(stripe_lock);
                 return (0);
             }
 
@@ -427,7 +426,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
             curr->next = cache->removed_head;
             cache->removed_head = curr;
         } else {
-            replaced_entry = curr;
+            free_entry_resources(cache, curr);
         }
     }
     /* Insert the new entry at the head of its key hash bucket */
@@ -446,10 +445,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
         memory_order_relaxed) + 1;
     current_capacity = cache->bucket_count;
     os_unfair_lock_unlock(stripe_lock);
-
-    if (replaced_entry != NULL) {
-        free_entry_resources(cache, replaced_entry);
-    }
 
     /* Expand hash tables when entry count exceeds bucket capacity */
     if (live_count > current_capacity && current_capacity < 65536) {
@@ -475,16 +470,15 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
             if (os_unfair_lock_trylock(tail_stripe_lock)) {
                 if (tail_node->retain_count == 0) {
                     unlink_entry(cache, tail_node);
+                    free_entry_resources(cache, tail_node);
                     cache_unlock_lru(cache);
                     os_unfair_lock_unlock(tail_stripe_lock);
-
-                    free_entry_resources(cache, tail_node);
                     return (0);
                 }
                 os_unfair_lock_unlock(tail_stripe_lock);
             }
+            cache_unlock_lru(cache);
         }
-        cache_unlock_lru(cache);
     }
 
     return (0);
@@ -532,10 +526,9 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
                         cache->attrs.user_data)) {
                         cache_lock_lru(cache);
                         unlink_entry(cache, curr);
+                        free_entry_resources(cache, curr);
                         cache_unlock_lru(cache);
                         os_unfair_lock_unlock(stripe_lock);
-
-                        free_entry_resources(cache, curr);
                         return (ENOENT);
                     }
                 }
@@ -601,12 +594,12 @@ cache_release_value(cache_t *cache, void *value)
                 stripe_lock = GET_STRIPE_LOCK(cache, curr->key_hash);
                 if (os_unfair_lock_trylock(stripe_lock)) {
                     curr->retain_count--;
-                    cache_unlock_lru(cache);
                     if (curr->retain_count == 0 &&
                         cache->attrs.value_make_purgeable_cb != NULL) {
                         cache->attrs.value_make_purgeable_cb(
                             curr->value, cache->attrs.user_data);
                     }
+                    cache_unlock_lru(cache);
                     os_unfair_lock_unlock(stripe_lock);
                     cache_release(cache);
                     return (0);
@@ -625,12 +618,12 @@ cache_release_value(cache_t *cache, void *value)
                         GET_STRIPE_LOCK(cache, curr->key_hash) == stripe_lock) {
                         if (curr->retain_count > 0) {
                             curr->retain_count--;
-                            cache_unlock_lru(cache);
                             if (curr->retain_count == 0 &&
                                 cache->attrs.value_make_purgeable_cb != NULL) {
                                 cache->attrs.value_make_purgeable_cb(
                                     curr->value, cache->attrs.user_data);
                             }
+                            cache_unlock_lru(cache);
                             os_unfair_lock_unlock(stripe_lock);
                             cache_release(cache);
                             return (0);
@@ -659,8 +652,8 @@ cache_release_value(cache_t *cache, void *value)
                         prev->next = curr->next;
                     else
                         cache->removed_head = curr->next;
-                    cache_unlock_lru(cache);
                     free_entry_resources(cache, curr);
+                    cache_unlock_lru(cache);
                     cache_release(cache);
                     return (0);
                 }
@@ -715,16 +708,12 @@ cache_remove(cache_t *cache, void *key)
             if (curr->retain_count > 0) {
                 curr->next = cache->removed_head;
                 cache->removed_head = curr;
-                cache_unlock_lru(cache);
-                os_unfair_lock_unlock(stripe_lock);
-                return (0);
+            } else {
+                free_entry_resources(cache, curr);
             }
 
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
-
-            /* Finalize and free the unretained entry outside the locks */
-            free_entry_resources(cache, curr);
             return (0);
         }
         curr = curr->next;
@@ -745,9 +734,7 @@ cache_remove(cache_t *cache, void *key)
 static void
 cache_remove_all_locked(cache_t *cache)
 {
-    cache_entry_t *curr, *next, *free_head, **removed_entry_ptr;
-
-    free_head = NULL;
+    cache_entry_t *curr, *next, **removed_entry_ptr;
 
     /* Partition active entries into immediate-free and deferred-retained lists */
     curr = cache->head;
@@ -760,8 +747,8 @@ cache_remove_all_locked(cache_t *cache)
             curr->next = cache->removed_head;
             cache->removed_head = curr;
         } else {
-            curr->next = free_head;
-            free_head = curr;
+            curr->next = NULL;
+            free_entry_resources(cache, curr);
         }
         curr = next;
     }
@@ -772,8 +759,8 @@ cache_remove_all_locked(cache_t *cache)
         curr = *removed_entry_ptr;
         if (curr->retain_count == 0) {
             *removed_entry_ptr = curr->next;
-            curr->next = free_head;
-            free_head = curr;
+            curr->next = NULL;
+            free_entry_resources(cache, curr);
         } else {
             removed_entry_ptr = &curr->next;
         }
@@ -786,20 +773,6 @@ cache_remove_all_locked(cache_t *cache)
     cache->tail = NULL;
     atomic_store_explicit(&cache->current_cost, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->current_count, 0, memory_order_relaxed);
-
-    if (free_head != NULL) {
-        cache_unlock_lru(cache);
-        cache_unlock_stripes(cache);
-
-        while (free_head != NULL) {
-            next = free_head->next;
-            free_entry_resources(cache, free_head);
-            free_head = next;
-        }
-
-        cache_lock_stripes(cache);
-        cache_lock_lru(cache);
-    }
 }
 
 /**
@@ -840,14 +813,13 @@ cache_remove_all(cache_t *cache)
 CACHE_PRIVATE_API int
 cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
 {
-    cache_entry_t *curr, *next_entry, *free_head;
+    cache_entry_t *curr, *next_entry;
     size_t b, active_capacity;
     int total_removed;
 
     if (cache == NULL || remove_block == NULL)
         return (EINVAL);
     total_removed = 0;
-    free_head = NULL;
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
@@ -865,8 +837,7 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
             if (curr->retain_count == 0 &&
                 remove_block(curr->key, curr->value)) {
                 unlink_entry(cache, curr);
-                curr->next = free_head;
-                free_head = curr;
+                free_entry_resources(cache, curr);
                 total_removed++;
             }
             curr = next_entry;
@@ -875,12 +846,6 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
 
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
-
-    while (free_head != NULL) {
-        next_entry = free_head->next;
-        free_entry_resources(cache, free_head);
-        free_head = next_entry;
-    }
 
     return (total_removed);
 }

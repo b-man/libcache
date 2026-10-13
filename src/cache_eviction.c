@@ -91,13 +91,11 @@ free_entry_resources(cache_t *cache, cache_entry_t *entry)
 int
 _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressure_flags_t flags)
 {
-    cache_entry_t *curr, *next_entry, *free_head;
+    cache_entry_t *curr, *next_entry;
     size_t b, active_capacity;
 
     if (cache == NULL)
         return (EINVAL);
-
-    free_head = NULL;
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
@@ -115,8 +113,7 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
             if (curr->retain_count == 0) {
                 if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
                     unlink_entry(cache, curr);
-                    curr->next = free_head;
-                    free_head = curr;
+                    free_entry_resources(cache, curr);
                     curr = next_entry;
                     continue;
                 }
@@ -135,12 +132,6 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
 
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
-
-    while (free_head != NULL) {
-        next_entry = free_head->next;
-        free_entry_resources(cache, free_head);
-        free_head = next_entry;
-    }
 
     return (0);
 }
