@@ -418,7 +418,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     /* Lock LRU once to handle both replacement unlinking and new entry insertion */
     cache_lock_lru(cache);
     if (curr != NULL) {
-        unlink_entry(cache, curr);
+        detach_entry(cache, curr);
         if (curr->retain_count > 0) {
             curr->next = cache->removed_head;
             cache->removed_head = curr;
@@ -466,7 +466,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
             /* Use trylock to avoid lock-order inversion while holding lru_lock */
             if (os_unfair_lock_trylock(tail_stripe_lock)) {
                 if (tail_node->retain_count == 0) {
-                    unlink_entry(cache, tail_node);
+                    detach_entry(cache, tail_node);
                     free_entry_resources(cache, tail_node);
                     cache_unlock_lru(cache);
                     os_unfair_lock_unlock(tail_stripe_lock);
@@ -474,8 +474,8 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                 }
                 os_unfair_lock_unlock(tail_stripe_lock);
             }
-            cache_unlock_lru(cache);
         }
+        cache_unlock_lru(cache);
     }
 
     return (0);
@@ -522,7 +522,7 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
                     if (!cache->attrs.value_make_nonpurgeable_cb(curr->value,
                         cache->attrs.user_data)) {
                         cache_lock_lru(cache);
-                        unlink_entry(cache, curr);
+                        detach_entry(cache, curr);
                         free_entry_resources(cache, curr);
                         cache_unlock_lru(cache);
                         os_unfair_lock_unlock(stripe_lock);
@@ -699,7 +699,7 @@ cache_remove(cache_t *cache, void *key)
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             /* Unlink the entry from hash buckets, LRU queue, and update metrics */
             cache_lock_lru(cache);
-            unlink_entry(cache, curr);
+            detach_entry(cache, curr);
 
             /* Defer finalization if the entry is still retained by a caller */
             if (curr->retain_count > 0) {
@@ -744,7 +744,6 @@ cache_remove_all_locked(cache_t *cache)
             curr->next = cache->removed_head;
             cache->removed_head = curr;
         } else {
-            curr->next = NULL;
             free_entry_resources(cache, curr);
         }
         curr = next;
@@ -756,7 +755,6 @@ cache_remove_all_locked(cache_t *cache)
         curr = *removed_entry_ptr;
         if (curr->retain_count == 0) {
             *removed_entry_ptr = curr->next;
-            curr->next = NULL;
             free_entry_resources(cache, curr);
         } else {
             removed_entry_ptr = &curr->next;
@@ -764,12 +762,12 @@ cache_remove_all_locked(cache_t *cache)
     }
 
     /* Clear hash tables, LRU pointers, and aggregate counters */
-    memset(cache->buckets, 0, cache->bucket_count * sizeof(cache_entry_t *));
-    memset(cache->val_buckets, 0, cache->val_bucket_count * sizeof(cache_entry_t *));
     cache->head = NULL;
     cache->tail = NULL;
-    atomic_store_explicit(&cache->current_cost, 0, memory_order_relaxed);
-    atomic_store_explicit(&cache->current_count, 0, memory_order_relaxed);
+    memset(cache->buckets, 0, cache->bucket_count * sizeof(cache_entry_t *));
+    memset(cache->val_buckets, 0, cache->val_bucket_count * sizeof(cache_entry_t *));
+    cache->current_cost = 0;
+    cache->current_count = 0;
 }
 
 /**
@@ -833,7 +831,7 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
             /* Remove unretained entries for which remove_block returns true */
             if (curr->retain_count == 0 &&
                 remove_block(curr->key, curr->value)) {
-                unlink_entry(cache, curr);
+                detach_entry(cache, curr);
                 free_entry_resources(cache, curr);
                 total_removed++;
             }

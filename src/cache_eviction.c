@@ -22,7 +22,7 @@
  * @param entry Entry node to unlink from hash buckets and LRU queue.
  */
 void
-unlink_entry(cache_t *cache, cache_entry_t *entry)
+detach_entry(cache_t *cache, cache_entry_t *entry)
 {
     cache_entry_t *curr, *prev;
 
@@ -112,7 +112,7 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
             /* Evict unretained entries under warning or critical memory pressure */
             if (curr->retain_count == 0) {
                 if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
-                    unlink_entry(cache, curr);
+                    detach_entry(cache, curr);
                     free_entry_resources(cache, curr);
                     curr = next_entry;
                     continue;

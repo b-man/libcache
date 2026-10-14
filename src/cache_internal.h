@@ -146,7 +146,7 @@ void attach_lru_head(cache_t *cache, cache_entry_t *entry);
 void attach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void free_entry_resources(cache_t *cache, cache_entry_t *entry);
-void unlink_entry(cache_t *cache, cache_entry_t *entry);
+void detach_entry(cache_t *cache, cache_entry_t *entry);
 
 int _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressure_flags_t flags);
 void _cache_sim_pressure_enroll(cache_t *cache);
