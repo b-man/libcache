@@ -157,28 +157,25 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     cache->lru_lock = OS_UNFAIR_LOCK_INIT;
 
     /* Copy attributes and apply default integer key callbacks if omitted */
-    switch (attrs->version) {
-        case CACHE_ATTRIBUTES_VERSION_2:
-            cache->attrs.value_retain_cb = attrs->value_retain_cb;
-            /* FALLTHROUGH */
-        case CACHE_ATTRIBUTES_VERSION_1:
-        default:
-            cache->attrs.version =
-                (attrs->version == CACHE_ATTRIBUTES_VERSION_2) ?
-                CACHE_ATTRIBUTES_VERSION_2 : CACHE_ATTRIBUTES_VERSION_1;
-            cache->attrs.key_hash_cb = (attrs->key_hash_cb != NULL) ?
-                attrs->key_hash_cb : cache_key_hash_cb_integer;
-            cache->attrs.key_is_equal_cb = (attrs->key_is_equal_cb != NULL) ?
-                attrs->key_is_equal_cb : cache_key_is_equal_cb_integer;
-            cache->attrs.key_retain_cb = attrs->key_retain_cb;
-            cache->attrs.key_release_cb = attrs->key_release_cb;
-            cache->attrs.value_release_cb = attrs->value_release_cb;
-            cache->attrs.value_make_nonpurgeable_cb =
-                attrs->value_make_nonpurgeable_cb;
-            cache->attrs.value_make_purgeable_cb =
-                attrs->value_make_purgeable_cb;
-            cache->attrs.user_data = attrs->user_data;
-            break;
+    cache->attrs.version = CACHE_ATTRIBUTES_VERSION_1;
+    cache->attrs.key_hash_cb = cache_key_hash_cb_integer;
+    cache->attrs.key_is_equal_cb = cache_key_is_equal_cb_integer;
+    cache->attrs.key_retain_cb = attrs->key_retain_cb;
+    cache->attrs.key_release_cb = attrs->key_release_cb;
+    cache->attrs.value_release_cb = attrs->value_release_cb;
+    cache->attrs.value_make_nonpurgeable_cb = attrs->value_make_nonpurgeable_cb;
+    cache->attrs.value_make_purgeable_cb = attrs->value_make_purgeable_cb;
+    cache->attrs.user_data = attrs->user_data;
+
+    if (attrs->key_hash_cb != NULL)
+        cache->attrs.key_hash_cb = attrs->key_hash_cb;
+
+    if (attrs->key_is_equal_cb != NULL)
+        cache->attrs.key_is_equal_cb = attrs->key_is_equal_cb;
+
+    if (attrs->version == CACHE_ATTRIBUTES_VERSION_2) {
+        cache->attrs.version = attrs->version;
+        cache->attrs.value_retain_cb = attrs->value_retain_cb;
     }
 
     /* Bind cache entry allocations to the default purgeable malloc zone */
