@@ -6,9 +6,9 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <sys/sysctl.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
 
@@ -114,7 +114,7 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
 {
     cache_t *cache;
     dispatch_queue_t monitor_queue;
-    size_t ncpu_len, initial_hint;
+    size_t initial_hint;
     int i, ncpu;
 
     if (name == NULL || cache_out == NULL || attrs == NULL)
@@ -131,9 +131,8 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     }
     
     /* Query logical CPU count to size the lock stripe array */
-    ncpu = 1;
-    ncpu_len = sizeof(ncpu);
-    if (sysctlbyname("hw.ncpu", &ncpu, &ncpu_len, NULL, 0) != 0 || ncpu < 1)
+    ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1)
         ncpu = 4;
 
     /* Round stripe count up to a power of two (at least 2 * ncpu) */
