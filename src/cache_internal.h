@@ -16,6 +16,9 @@
 #include "cache_private.h"
 #include "cache_callbacks.h"
 
+/* Maximum number of hash table buckets permitted during rehash expansion. */
+#define CACHE_MAX_BUCKET_COUNT 65536
+
 /* Maps a key hash value to its stripe lock pointer using stripe_mask. */
 #define GET_STRIPE_LOCK(cache, hash_val) \
     (&((cache)->locks[(hash_val) & (cache)->stripe_mask]))

@@ -443,7 +443,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     os_unfair_lock_unlock(stripe_lock);
 
     /* Expand hash tables when entry count exceeds bucket capacity */
-    if (live_count > current_capacity && current_capacity < 65536) {
+    if (live_count > current_capacity && current_capacity < CACHE_MAX_BUCKET_COUNT) {
         cache_rehash_expand_internal(cache);
     }
 
