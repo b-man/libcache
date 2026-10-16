@@ -56,6 +56,7 @@ void test_cache_private_remove_with_block_callback_false(void);
 void test_private_simulate_memory_warning(void);
 void test_cache_private_release(void);
 void test_cache_private_release_multithreaded(void);
+void test_cache_segmented_lru(void);
 #endif
 
 #endif /* !_TEST_SUITE_H_ */

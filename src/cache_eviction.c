@@ -14,22 +14,19 @@
 #include "cache_internal.h"
 
 /**
- * @brief Unlinks a cache entry from the key hash table, value-pointer hash
- *        table, and LRU queue, and updates cache metrics.
- * @details Caller must hold the stripe lock covering entry->key_hash (or all
- *          stripe locks) and cache->lru_lock.
+ * @brief Unlinks an entry from its key hash bucket collision chain.
+ * @details Caller must hold the stripe lock protecting entry->key_hash.
  * @param cache A valid cache instance.
- * @param entry Entry node to unlink from hash buckets and LRU queue.
+ * @param entry Entry node to unlink from the key hash bucket.
  */
 void
-detach_entry(cache_t *cache, cache_entry_t *entry)
+detach_key_bucket(cache_t *cache, cache_entry_t *entry)
 {
     cache_entry_t *curr, *prev;
 
     if (cache == NULL || entry == NULL)
         return;
 
-    /* Unlink from the key hash bucket chain */
     curr = GET_KEY_BUCKET(cache, entry->key_hash);
     prev = NULL;
     while (curr != NULL) {
@@ -44,12 +41,59 @@ detach_entry(cache_t *cache, cache_entry_t *entry)
         prev = curr;
         curr = curr->next;
     }
+}
+
+/**
+ * @brief Unlinks a cache entry from the key hash table, value-pointer hash
+ *        table, and LRU queue, and updates cache metrics.
+ * @details Caller must hold the stripe lock covering entry->key_hash (or all
+ *          stripe locks) and cache->lru_lock.
+ * @param cache A valid cache instance.
+ * @param entry Entry node to unlink from hash buckets and LRU queue.
+ */
+void
+detach_entry(cache_t *cache, cache_entry_t *entry)
+{
+    if (cache == NULL || entry == NULL)
+        return;
+
+    /* Unlink from the key hash bucket chain */
+    detach_key_bucket(cache, entry);
 
     /* Unlink from the doubly linked LRU queue */
     detach_lru(cache, entry);
 
     /* Unlink from the value-pointer hash bucket chain */
     detach_val_bucket(cache, entry);
+
+    /* Update aggregate cost and live entry count */
+    atomic_fetch_sub_explicit(&cache->current_cost, entry->cost,
+        memory_order_relaxed);
+    atomic_fetch_sub_explicit(&cache->current_count, 1,
+        memory_order_relaxed);
+}
+
+/**
+ * @brief Marks an entry as removed from lookups while preserving it in the
+ *        value-pointer index for deferred O(1) release.
+ * @details Caller must hold both the entry's stripe lock and cache->lru_lock.
+ * @param cache A valid cache instance.
+ * @param entry Entry node to unlink from key lookups and LRU list.
+ */
+void
+mark_entry_removed(cache_t *cache, cache_entry_t *entry)
+{
+    if (cache == NULL || entry == NULL)
+        return;
+
+    /* Unlink from key bucket so subsequent key lookups miss */
+    detach_key_bucket(cache, entry);
+
+    /* Unlink from the LRU queue so eviction ignores it */
+    detach_lru(cache, entry);
+
+    /* Mark as removed; entry stays in value index until retain_count reaches 0 */
+    entry->is_removed = true;
 
     /* Update aggregate cost and live entry count */
     atomic_fetch_sub_explicit(&cache->current_cost, entry->cost,
@@ -68,11 +112,14 @@ detach_entry(cache_t *cache, cache_entry_t *entry)
 void
 free_entry_resources(cache_t *cache, cache_entry_t *entry)
 {
-    if (cache->attrs.value_release_cb != NULL) {
+    if (cache == NULL || entry == NULL)
+        return;
+
+    if (cache->attrs.value_release_cb != NULL && entry->value != NULL) {
         cache->attrs.value_release_cb(entry->value, cache->attrs.user_data);
     }
 
-    if (cache->attrs.key_release_cb != NULL) {
+    if (cache->attrs.key_release_cb != NULL && entry->key != NULL) {
         cache->attrs.key_release_cb(entry->key, cache->attrs.user_data);
     }
 
@@ -104,7 +151,7 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
 
     /* Scan all key buckets for unretained or purgeable entries */
     for (b = 0; b < active_capacity; b++) {
-        curr = cache->buckets[b];
+        curr = cache->buckets[b].key_head;
 
         while (curr != NULL) {
             next_entry = curr->next;

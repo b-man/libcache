@@ -1274,6 +1274,76 @@ test_cache_private_release_multithreaded(void)
         "All 132 keys and values must be cleanly released after all threads finish");
 }
 
+/*
+ * Validates Segmented LRU (SLRU) eviction policy:
+ * - New entries start in the probationary segment.
+ * - Accessed entries are promoted to the protected segment.
+ * - Under capacity pressure (count_hint), eviction selects from the probationary tail first,
+ *   protecting frequently used entries from being flushed by one-hit wonders.
+ * - When the protected segment overflows, its LRU entry is demoted back to the probationary segment.
+ */
+void
+test_cache_segmented_lru(void)
+{
+    cache_t *cache = NULL;
+    cache_attributes_t attrs;
+    void *val_out = NULL;
+    int status;
 
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.version = CACHE_ATTRIBUTES_VERSION_2;
+    attrs.key_hash_cb = cache_key_hash_cb_cstring;
+    attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
+    attrs.value_release_cb = cache_release_cb_free;
 
+    status = cache_create("com.test.slru", &attrs, &cache);
+    ASSERT_TRUE(status == 0 && cache != NULL, "cache_create for SLRU test must succeed");
+
+    /* Set count hint to 3 */
+    status = cache_set_count_hint(cache, 3);
+    ASSERT_TRUE(status == 0, "cache_set_count_hint must return 0");
+
+    char *v1 = strdup("val_1");
+    char *v2 = strdup("val_2");
+    char *v3 = strdup("val_3");
+    char *v4 = strdup("val_4");
+
+    /* Insert k1 and release it */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k1", v1, 10) == 0, "Inserting k1 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v1) == 0, "Releasing k1 must succeed");
+
+    /* Access k1 via cache_get to promote it to the protected segment */
+    ASSERT_TRUE(cache_get(cache, "k1", &val_out) == 0 && val_out == v1, "cache_get for k1 must succeed");
+
+    /* Insert k2 and k3 (one-hit wonders, unreferenced in probationary segment) */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k2", v2, 10) == 0, "Inserting k2 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v2) == 0, "Releasing k2 must succeed");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "k3", v3, 10) == 0, "Inserting k3 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v3) == 0, "Releasing k3 must succeed");
+
+    /*
+     * At this point:
+     * - k1 was accessed and promoted to protected segment.
+     * - k2 was inserted then k3 was inserted into probationary segment.
+     * In single-queue LRU: k1 is the oldest accessed entry (accessed before k2 and k3 were inserted).
+     * In Segmented LRU: k1 is protected; k2 is the tail of the probationary segment.
+     *
+     * Insert k4 (count_hint = 3 exceeded).
+     * SLRU must evict k2 (probationary tail) instead of k1 (protected)!
+     */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k4", v4, 10) == 0, "Inserting k4 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v4) == 0, "Releasing k4 must succeed");
+
+    ASSERT_TRUE(cache_get(cache, "k1", &val_out) == 0 && val_out == v1,
+        "Frequently accessed entry k1 in protected segment must NOT be evicted");
+    ASSERT_TRUE(cache_get(cache, "k2", &val_out) == ENOENT,
+        "One-hit entry k2 at probationary tail must be evicted");
+    ASSERT_TRUE(cache_get(cache, "k3", &val_out) == 0 && val_out == v3,
+        "Newer entry k3 must remain in cache");
+    ASSERT_TRUE(cache_get(cache, "k4", &val_out) == 0 && val_out == v4,
+        "Newest entry k4 must remain in cache");
+
+    ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
+}
 

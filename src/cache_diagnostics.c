@@ -245,8 +245,16 @@ cache_print(cache_t *cache)
     cache_lock_lru(cache);
 
     printf("--- Cache Snapshot Dump: %s ---\n", cache->name);
-    curr = cache->head;
+    printf(" [Protected Segment (count: %zu)]:\n", cache->prot_count);
+    curr = cache->prot_head;
+    while (curr != NULL) {
+        printf("  Key=%p | Cost=%zu | Holds=%d\n", curr->key,
+            curr->cost, curr->retain_count);
+        curr = curr->lru_next;
+    }
 
+    printf(" [Probationary Segment (count: %zu)]:\n", cache->prob_count);
+    curr = cache->prob_head;
     while (curr != NULL) {
         printf("  Key=%p | Cost=%zu | Holds=%d\n", curr->key,
             curr->cost, curr->retain_count);
@@ -260,8 +268,9 @@ cache_print(cache_t *cache)
 /**
  * @brief Prints a summary of the cache's runtime metrics and hash table
  *        configuration to standard output.
- * @details Displays the cache name, live entry count, aggregate cost, stripe
- *          count, bucket count, bucket mask, and count hint ceiling.
+ * @details Displays the cache name, live entry count, segment counts,
+ *          aggregate cost, stripe count, bucket count, bucket mask, and
+ *          count hint ceiling.
  * @param cache A valid cache instance to inspect (ignored if NULL).
  */
 CACHE_PRIVATE_API void
@@ -275,6 +284,8 @@ cache_print_stats(cache_t *cache)
     printf("--- Cache Runtime Detailed Metrics Snapshot ---\n");
     printf("  Label Descriptor    : %s\n", cache->name);
     printf("  Live Node Count     : %zu\n", atomic_load(&cache->current_count));
+    printf("  Protected Nodes     : %zu\n", cache->prot_count);
+    printf("  Probationary Nodes  : %zu\n", cache->prob_count);
     printf("  Aggregated cost Sum : %zu\n", atomic_load(&cache->current_cost));
     printf("  Lock Stripe Shards  : %zu concurrent lanes\n", cache->num_stripes);
     printf("  Allocated Buckets   : %zu tables slots\n", cache->bucket_count);

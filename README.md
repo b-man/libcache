@@ -13,6 +13,9 @@ Core Features
 
 * Lock Striping: Distributes elements across independent shards to minimize
   multi-threaded lock contention.
+* Segmented LRU (SLRU) Eviction: Partitions cache queues into probationary and
+  protected segments, ensuring recently and frequently accessed values are protected
+  from being evicted by one-hit wonder scans.
 * Kernel Eviction Hooks: Monitors low-priority GCD memory pressure queues to
   purge unretained nodes under resource strain.
 * Retain/Release Lifecycles: Tracks unpinned elements by reference counts,

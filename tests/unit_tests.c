@@ -47,6 +47,7 @@ main(void)
     RUN_TEST(test_private_simulate_memory_warning);
     RUN_TEST(test_cache_private_release);
     RUN_TEST(test_cache_private_release_multithreaded);
+    RUN_TEST(test_cache_segmented_lru);
 #endif
 
     printf("\n========================================================================\n");

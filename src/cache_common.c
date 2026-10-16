@@ -26,8 +26,7 @@
 static void
 cache_rehash_expand_internal(cache_t *cache)
 {
-    cache_entry_t **new_buckets, **old_buckets;
-    cache_entry_t **new_val_buckets, **old_val_buckets;
+    cache_bucket_t *new_buckets, *old_buckets;
     cache_entry_t *curr, *next_node;
     size_t old_count, new_count, new_mask, hash_val, val_slot, i;
 
@@ -36,15 +35,9 @@ cache_rehash_expand_internal(cache_t *cache)
     new_count = old_count << 1;
     new_mask = new_count - 1;
 
-    new_buckets = calloc(new_count, sizeof(cache_entry_t *));
+    new_buckets = calloc(new_count, sizeof(cache_bucket_t));
     if (new_buckets == NULL)
         return;
-
-    new_val_buckets = calloc(new_count, sizeof(cache_entry_t *));
-    if (new_val_buckets == NULL) {
-        free(new_buckets);
-        return;
-    }
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
@@ -53,43 +46,44 @@ cache_rehash_expand_internal(cache_t *cache)
     if (cache->bucket_count != old_count) {
         cache_unlock_lru(cache);
         cache_unlock_stripes(cache);
-        free(new_val_buckets);
         free(new_buckets);
         return;
     }
 
     old_buckets = cache->buckets;
-    old_val_buckets = cache->val_buckets;
 
-    /* Rehash all active entries into the expanded key and value bucket arrays */
+    /* Rehash all active entries into the expanded key bucket chains */
     for (i = 0; i < old_count; i++) {
-        curr = old_buckets[i];
+        curr = old_buckets[i].key_head;
         while (curr != NULL) {
             next_node = curr->next;
             hash_val = curr->key_hash & new_mask;
-            curr->next = new_buckets[hash_val];
-            new_buckets[hash_val] = curr;
-
-            val_slot = cache_hash_pointer(curr->value) & new_mask;
-            curr->val_next = new_val_buckets[val_slot];
-            new_val_buckets[val_slot] = curr;
-
+            curr->next = new_buckets[hash_val].key_head;
+            new_buckets[hash_val].key_head = curr;
             curr = next_node;
         }
     }
 
-    /* Install the expanded bucket arrays, counts, and masks */
+    /* Rehash all entries (active and deferred) into the expanded value bucket chains */
+    for (i = 0; i < old_count; i++) {
+        curr = old_buckets[i].val_head;
+        while (curr != NULL) {
+            next_node = curr->val_next;
+            val_slot = cache_hash_pointer(curr->value) & new_mask;
+            curr->val_next = new_buckets[val_slot].val_head;
+            new_buckets[val_slot].val_head = curr;
+            curr = next_node;
+        }
+    }
+
+    /* Install the expanded bucket array, count, and mask */
     cache->buckets = new_buckets;
     cache->bucket_count = new_count;
     cache->bucket_mask = new_mask;
-    cache->val_buckets = new_val_buckets;
-    cache->val_bucket_count = new_count;
-    cache->val_bucket_mask = new_mask;
 
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
-    free(old_val_buckets);
     free(old_buckets);
 }
 
@@ -188,20 +182,9 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
         cache->bucket_count <<= 1;
     }
     cache->bucket_mask = cache->bucket_count - 1;
-    cache->val_bucket_count = cache->bucket_count;
-    cache->val_bucket_mask = cache->bucket_mask;
 
-    cache->buckets = calloc(cache->bucket_count, sizeof(cache_entry_t *));
+    cache->buckets = calloc(cache->bucket_count, sizeof(cache_bucket_t));
     if (cache->buckets == NULL) {
-        free(cache->locks);
-        free(cache->name);
-        free(cache);
-        return (ENOMEM);
-    }
-
-    cache->val_buckets = calloc(cache->val_bucket_count, sizeof(cache_entry_t *));
-    if (cache->val_buckets == NULL) {
-        free(cache->buckets);
         free(cache->locks);
         free(cache->name);
         free(cache);
@@ -326,8 +309,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
 
     /* Retain incoming value for VERSION_2 attributes (if configured) */
     value_store = value;
-    if (value_store != NULL &&
-        cache->attrs.version == CACHE_ATTRIBUTES_VERSION_2 &&
+    if (cache->attrs.version == CACHE_ATTRIBUTES_VERSION_2 &&
         cache->attrs.value_retain_cb != NULL) {
         cache->attrs.value_retain_cb(value_store, cache->attrs.user_data);
     }
@@ -335,14 +317,12 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     /* Allocate and initialize entry metadata */
     entry = malloc_zone_malloc(cache->memory_zone, sizeof(cache_entry_t));
     if (entry == NULL) {
-        if (value_store != NULL &&
-            cache->attrs.version == CACHE_ATTRIBUTES_VERSION_2 &&
+        if (cache->attrs.version == CACHE_ATTRIBUTES_VERSION_2 &&
             cache->attrs.value_retain_cb != NULL &&
             cache->attrs.value_release_cb != NULL) {
             cache->attrs.value_release_cb(value_store, cache->attrs.user_data);
         }
-        if (cache->attrs.key_retain_cb != NULL &&
-            cache->attrs.key_release_cb != NULL && key_copy != NULL) {
+        if (cache->attrs.key_release_cb != NULL) {
             cache->attrs.key_release_cb(key_copy, cache->attrs.user_data);
         }
         return (ENOMEM);
@@ -352,7 +332,12 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     entry->key_hash = hash_val;
     entry->cost = cost;
     entry->retain_count = (value_store != NULL) ? 1 : 0;
+    entry->is_removed = false;
+    entry->is_protected = false;
+    entry->next = NULL;
     entry->val_next = NULL;
+    entry->lru_next = NULL;
+    entry->lru_prev = NULL;
 
     stripe_lock = GET_STRIPE_LOCK(cache, hash_val);
     os_unfair_lock_lock(stripe_lock);
@@ -363,6 +348,10 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             if (curr->value == value_store) {
                 /* Same value pointer: update existing entry in place and free new node */
+                old_key = curr->key;
+                curr->key = key_copy;
+
+                cache_lock_lru(cache);
                 if (value_store != NULL) {
                     if (curr->retain_count == 0 &&
                         cache->attrs.value_make_nonpurgeable_cb != NULL) {
@@ -372,14 +361,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                     curr->retain_count++;
                     cache_retain(cache);
                 }
-                old_key = curr->key;
-                curr->key = key_copy;
-
-                cache_lock_lru(cache);
-                if (cache->head != curr) {
-                    detach_lru(cache, curr);
-                    attach_lru_head(cache, curr);
-                }
                 if (cost > curr->cost) {
                     atomic_fetch_add_explicit(&cache->current_cost,
                         cost - curr->cost, memory_order_relaxed);
@@ -388,22 +369,13 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                         curr->cost - cost, memory_order_relaxed);
                 }
                 curr->cost = cost;
-                cache_unlock_lru(cache);
 
-                malloc_zone_free(cache->memory_zone, entry);
-                if (value_store != NULL &&
-                    cache->attrs.version == CACHE_ATTRIBUTES_VERSION_2 &&
-                    cache->attrs.value_retain_cb != NULL &&
-                    cache->attrs.value_release_cb != NULL) {
-                    cache->attrs.value_release_cb(value_store,
-                        cache->attrs.user_data);
-                }
-                if (cache->attrs.key_retain_cb != NULL &&
-                    cache->attrs.key_release_cb != NULL &&
-                    old_key != NULL && old_key != key_copy) {
-                    cache->attrs.key_release_cb(old_key,
-                        cache->attrs.user_data);
-                }
+                entry->key = (old_key != key_copy) ? old_key : NULL;
+                entry->value = NULL;
+                free_entry_resources(cache, entry);
+
+                touch_entry(cache, curr);
+                cache_unlock_lru(cache);
                 os_unfair_lock_unlock(stripe_lock);
                 return (0);
             }
@@ -417,11 +389,10 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     /* Lock LRU once to handle both replacement unlinking and new entry insertion */
     cache_lock_lru(cache);
     if (curr != NULL) {
-        detach_entry(cache, curr);
         if (curr->retain_count > 0) {
-            curr->next = cache->removed_head;
-            cache->removed_head = curr;
+            mark_entry_removed(cache, curr);
         } else {
+            detach_entry(cache, curr);
             free_entry_resources(cache, curr);
         }
     }
@@ -431,7 +402,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     if (value_store != NULL) {
         cache_retain(cache);
     }
-    attach_lru_head(cache, entry);
+    attach_probation_head(cache, entry);
     attach_val_bucket(cache, entry);
     cache_unlock_lru(cache);
 
@@ -447,15 +418,24 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
         cache_rehash_expand_internal(cache);
     }
 
-    /* Evict the least-recently-used unretained entry if count_hint is exceeded */
+    /* Evict an unretained entry if count_hint is exceeded (SLRU: probationary tail first, then protected tail) */
     count_limit = atomic_load_explicit(&cache->configured_count_hint,
         memory_order_relaxed);
     if (count_limit > 0 && live_count > count_limit) {
         cache_lock_lru(cache);
-        tail_node = cache->tail;
         
+        /* First try to evict an unretained entry from probationary segment (LRU tail to head) */
+        tail_node = cache->prob_tail;
         while (tail_node != NULL && tail_node->retain_count > 0) {
             tail_node = tail_node->lru_prev;
+        }
+
+        /* If no unretained entry in probationary segment, search protected segment */
+        if (tail_node == NULL) {
+            tail_node = cache->prot_tail;
+            while (tail_node != NULL && tail_node->retain_count > 0) {
+                tail_node = tail_node->lru_prev;
+            }
         }
 
         if (tail_node != NULL) {
@@ -515,12 +495,12 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             /* If unretained, mark value non-purgeable and evict if it was purged */
+            cache_lock_lru(cache);
             if (curr->value != NULL) {
                 if (curr->retain_count == 0 &&
                     cache->attrs.value_make_nonpurgeable_cb != NULL) {
                     if (!cache->attrs.value_make_nonpurgeable_cb(curr->value,
                         cache->attrs.user_data)) {
-                        cache_lock_lru(cache);
                         detach_entry(cache, curr);
                         free_entry_resources(cache, curr);
                         cache_unlock_lru(cache);
@@ -535,12 +515,8 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
             }
             *value_out = curr->value;
             
-            /* Promote the entry to the MRU head of the LRU list */
-            cache_lock_lru(cache);
-            if (cache->head != curr) {
-                detach_lru(cache, curr);
-                attach_lru_head(cache, curr);
-            }
+            /* Promote the entry via SLRU rules */
+            touch_entry(cache, curr);
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
             return (0);
@@ -567,10 +543,8 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
 CACHE_PUBLIC_API int
 cache_release_value(cache_t *cache, void *value)
 {
-    cache_entry_t *curr, *prev;
-    os_unfair_lock_t stripe_lock;
-    size_t val_slot;
-    bool found_unretained;
+    cache_entry_t *curr;
+    size_t val_hash;
 
     if (cache == NULL)
         return (EINVAL);
@@ -578,80 +552,26 @@ cache_release_value(cache_t *cache, void *value)
     if (value == NULL)
         return (0);
 
-    found_unretained = false;
-
     /* Fast O(1) lookup via value-pointer hash index under lru_lock */
     cache_lock_lru(cache);
-    val_slot = cache_hash_pointer(value) & cache->val_bucket_mask;
-    curr = cache->val_buckets[val_slot];
-    while (curr != NULL) {
-        if (curr->value == value) {
-            if (curr->retain_count > 0) {
-                stripe_lock = GET_STRIPE_LOCK(cache, curr->key_hash);
-                if (os_unfair_lock_trylock(stripe_lock)) {
-                    curr->retain_count--;
-                    if (curr->retain_count == 0 &&
-                        cache->attrs.value_make_purgeable_cb != NULL) {
-                        cache->attrs.value_make_purgeable_cb(
-                            curr->value, cache->attrs.user_data);
-                    }
-                    cache_unlock_lru(cache);
-                    os_unfair_lock_unlock(stripe_lock);
-                    cache_release(cache);
-                    return (0);
-                }
-
-                /* Contended stripe lock: re-acquire in canonical order (stripe -> lru) */
-                cache_unlock_lru(cache);
-                os_unfair_lock_lock(stripe_lock);
-                cache_lock_lru(cache);
-
-                /* Re-verify entry after re-acquiring locks */
-                val_slot = cache_hash_pointer(value) & cache->val_bucket_mask;
-                curr = cache->val_buckets[val_slot];
-                while (curr != NULL) {
-                    if (curr->value == value &&
-                        GET_STRIPE_LOCK(cache, curr->key_hash) == stripe_lock) {
-                        if (curr->retain_count > 0) {
-                            curr->retain_count--;
-                            if (curr->retain_count == 0 &&
-                                cache->attrs.value_make_purgeable_cb != NULL) {
-                                cache->attrs.value_make_purgeable_cb(
-                                    curr->value, cache->attrs.user_data);
-                            }
-                            cache_unlock_lru(cache);
-                            os_unfair_lock_unlock(stripe_lock);
-                            cache_release(cache);
-                            return (0);
-                        }
-                        found_unretained = true;
-                    }
-                    curr = curr->val_next;
-                }
-                os_unfair_lock_unlock(stripe_lock);
-                break;
-            }
-            found_unretained = true;
-        }
-        curr = curr->val_next;
-    }
-
-    /* Check entries that were removed while still retained by a caller */
-    curr = cache->removed_head;
-    prev = NULL;
+    val_hash = cache_hash_pointer(value);
+    curr = GET_VAL_BUCKET(cache, val_hash);
     while (curr != NULL) {
         if (curr->value == value) {
             if (curr->retain_count > 0) {
                 curr->retain_count--;
                 if (curr->retain_count == 0) {
-                    if (prev != NULL)
-                        prev->next = curr->next;
-                    else
-                        cache->removed_head = curr->next;
-                    free_entry_resources(cache, curr);
-                    cache_unlock_lru(cache);
-                    cache_release(cache);
-                    return (0);
+                    if (curr->is_removed) {
+                        detach_val_bucket(cache, curr);
+                        free_entry_resources(cache, curr);
+                        cache_unlock_lru(cache);
+                        cache_release(cache);
+                        return (0);
+                    }
+                    if (cache->attrs.value_make_purgeable_cb != NULL) {
+                        cache->attrs.value_make_purgeable_cb(
+                            curr->value, cache->attrs.user_data);
+                    }
                 }
                 cache_unlock_lru(cache);
                 cache_release(cache);
@@ -660,12 +580,11 @@ cache_release_value(cache_t *cache, void *value)
             cache_unlock_lru(cache);
             return (0);
         }
-        prev = curr;
-        curr = curr->next;
+        curr = curr->val_next;
     }
     cache_unlock_lru(cache);
 
-    return (found_unretained ? 0 : ENOENT);
+    return (ENOENT);
 }
 
 /**
@@ -698,16 +617,12 @@ cache_remove(cache_t *cache, void *key)
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             /* Unlink the entry from hash buckets, LRU queue, and update metrics */
             cache_lock_lru(cache);
-            detach_entry(cache, curr);
-
-            /* Defer finalization if the entry is still retained by a caller */
             if (curr->retain_count > 0) {
-                curr->next = cache->removed_head;
-                cache->removed_head = curr;
+                mark_entry_removed(cache, curr);
             } else {
+                detach_entry(cache, curr);
                 free_entry_resources(cache, curr);
             }
-
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
             return (0);
@@ -722,49 +637,75 @@ cache_remove(cache_t *cache, void *key)
  * @brief Evicts all live entries from the cache while all stripe locks and
  *        the LRU lock are held.
  * @details Unretained entries are finalized and freed, while currently
- *          retained entries are moved to removed_head for deferred
- *          finalization. Any entries on removed_head whose retain count is
- *          zero are also finalized and freed.
+ *          retained entries remain indexed by value for deferred O(1)
+ *          finalization via cache_release_value.
  * @param cache A valid locked cache instance.
  */
 static void
 cache_remove_all_locked(cache_t *cache)
 {
-    cache_entry_t *curr, *next, **removed_entry_ptr;
+    cache_entry_t *curr, *next;
+    size_t b;
 
-    /* Partition active entries into immediate-free and deferred-retained lists */
-    curr = cache->head;
-    while (curr != NULL) {
-        next = curr->lru_next;
-        curr->lru_prev = NULL;
-        curr->lru_next = NULL;
-        curr->val_next = NULL;
-        if (curr->retain_count > 0) {
-            curr->next = cache->removed_head;
-            cache->removed_head = curr;
-        } else {
-            free_entry_resources(cache, curr);
-        }
-        curr = next;
+    /* Unlink all key bucket heads so key lookups miss immediately */
+    for (b = 0; b < cache->bucket_count; b++) {
+        cache->buckets[b].key_head = NULL;
     }
 
-    /* Sweep any unretained entries from removed_head (e.g., cleared during destroy) */
-    removed_entry_ptr = &cache->removed_head;
-    while (*removed_entry_ptr != NULL) {
-        curr = *removed_entry_ptr;
-        if (curr->retain_count == 0) {
-            *removed_entry_ptr = curr->next;
-            free_entry_resources(cache, curr);
-        } else {
-            removed_entry_ptr = &curr->next;
-        }
-    }
+    /* Process all active entries across protected and probationary segments */
+    cache_entry_t *seg_heads[2];
+    int s;
 
-    /* Clear hash tables, LRU pointers, and aggregate counters */
+    seg_heads[0] = cache->prot_head;
+    seg_heads[1] = cache->prob_head;
+
+    cache->prot_head = NULL;
+    cache->prot_tail = NULL;
+    cache->prot_count = 0;
+    cache->prob_head = NULL;
+    cache->prob_tail = NULL;
+    cache->prob_count = 0;
     cache->head = NULL;
     cache->tail = NULL;
-    memset(cache->buckets, 0, cache->bucket_count * sizeof(cache_entry_t *));
-    memset(cache->val_buckets, 0, cache->val_bucket_count * sizeof(cache_entry_t *));
+
+    for (s = 0; s < 2; s++) {
+        curr = seg_heads[s];
+        while (curr != NULL) {
+            next = curr->lru_next;
+            curr->lru_prev = NULL;
+            curr->lru_next = NULL;
+            curr->next = NULL;
+            if (curr->retain_count > 0) {
+                curr->is_removed = true;
+            } else {
+                detach_val_bucket(cache, curr);
+                free_entry_resources(cache, curr);
+            }
+            curr = next;
+        }
+    }
+
+    /* Sweep any unretained entries from value buckets */
+    for (b = 0; b < cache->bucket_count; b++) {
+        cache_entry_t *val_curr = cache->buckets[b].val_head;
+        cache_entry_t *val_prev = NULL;
+        while (val_curr != NULL) {
+            cache_entry_t *val_next = val_curr->val_next;
+            if (val_curr->retain_count == 0) {
+                if (val_prev != NULL)
+                    val_prev->val_next = val_next;
+                else
+                    cache->buckets[b].val_head = val_next;
+                val_curr->val_next = NULL;
+                free_entry_resources(cache, val_curr);
+            } else {
+                val_curr->is_removed = true;
+                val_prev = val_curr;
+            }
+            val_curr = val_next;
+        }
+    }
+
     cache->current_cost = 0;
     cache->current_count = 0;
 }
@@ -822,7 +763,7 @@ cache_remove_with_block(cache_t *cache, cache_remove_block_t remove_block)
 
     /* Scan all key buckets and evaluate remove_block on unretained entries */
     for (b = 0; b < active_capacity; b++) {
-        curr = cache->buckets[b];
+        curr = cache->buckets[b].key_head;
 
         while (curr != NULL) {
             next_entry = curr->next;
@@ -877,12 +818,9 @@ cache_get(cache_t *cache, void *key, void **value_out)
             /* Return the value pointer without modifying the entry's retain count */
             *value_out = curr->value;
             
-            /* Promote the entry to the MRU head of the LRU list */
+            /* Promote the entry via SLRU rules */
             cache_lock_lru(cache);
-            if (cache->head != curr) {
-                detach_lru(cache, curr);
-                attach_lru_head(cache, curr);
-            }
+            touch_entry(cache, curr);
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
             return (0);
@@ -967,8 +905,7 @@ cache_release(cache_t *cache)
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
-    /* Free internal hash tables, lock array, name string, and cache container */
-    free(cache->val_buckets);
+    /* Free internal hash table, lock array, name string, and cache container */
     free(cache->buckets);
     free(cache->locks);
     free(cache->name);
@@ -988,6 +925,7 @@ CACHE_PUBLIC_API int
 cache_destroy(cache_t *cache)
 {
     cache_entry_t *curr;
+    size_t b;
 
     if (cache == NULL)
         return (EINVAL);
@@ -997,11 +935,16 @@ cache_destroy(cache_t *cache)
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
 
-    for (curr = cache->head; curr != NULL; curr = curr->lru_next)
+    for (curr = cache->prot_head; curr != NULL; curr = curr->lru_next)
         curr->retain_count = 0;
 
-    for (curr = cache->removed_head; curr != NULL; curr = curr->next)
+    for (curr = cache->prob_head; curr != NULL; curr = curr->lru_next)
         curr->retain_count = 0;
+
+    for (b = 0; b < cache->bucket_count; b++) {
+        for (curr = cache->buckets[b].val_head; curr != NULL; curr = curr->val_next)
+            curr->retain_count = 0;
+    }
 
     atomic_store_explicit(&cache->ref_count, 1, memory_order_release);
 
@@ -1165,15 +1108,12 @@ cache_invoke(cache_t *cache, void *key, cache_invoke_cb_t invoke_cb,
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             
             /* Retain the entry and promote it to the MRU head before unlocking */
+            cache_lock_lru(cache);
             if (curr->value != NULL) {
                 curr->retain_count++;
                 cache_retain(cache);
             }
-            cache_lock_lru(cache);
-            if (cache->head != curr) {
-                detach_lru(cache, curr);
-                attach_lru_head(cache, curr);
-            }
+            touch_entry(cache, curr);
             cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
 

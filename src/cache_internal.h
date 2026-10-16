@@ -25,7 +25,11 @@
 
 /* Maps a key hash value to its key hash bucket head using bucket_mask. */
 #define GET_KEY_BUCKET(cache, hash_val) \
-    ((cache)->buckets[(hash_val) & (cache)->bucket_mask])
+    ((cache)->buckets[(hash_val) & (cache)->bucket_mask].key_head)
+
+/* Maps a value hash value to its value-pointer hash bucket head using bucket_mask. */
+#define GET_VAL_BUCKET(cache, hash_val) \
+    ((cache)->buckets[(hash_val) & (cache)->bucket_mask].val_head)
 
 /* Computes the hash value for a key using the configured key_hash_cb. */
 #define CACHE_KEY_HASH(cache, key) \
@@ -47,25 +51,33 @@
 static inline size_t
 cache_hash_pointer(const void *ptr)
 {
-    uintptr_t v = (uintptr_t)ptr;
+    uintptr_t v = (uintptr_t)ptr >> 4;
     v ^= v >> 33;
     v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 33;
     return ((size_t)v);
 }
 
-/* Cache entry node stored in the key hash table, value index, and LRU list. */
+/* Cache entry node stored in the key hash table, value index, and SLRU segments. */
 typedef struct cache_entry_s {
     void                    *key;          /* Entry key pointer. */
     void                    *value;        /* Entry value pointer. */
     uintptr_t                key_hash;     /* Cached key hash value. */
     cache_cost_t             cost;         /* Entry cost weight. */
     int                      retain_count; /* Reference count; prevents eviction when > 0. */
-    struct cache_entry_s    *next;         /* Next entry in key bucket, removed_head, or free list. */
+    bool                     is_removed;   /* True if entry was unlinked from cache while still retained. */
+    bool                     is_protected; /* True if entry is in protected segment; false if probationary. */
+    struct cache_entry_s    *next;         /* Next entry in key bucket or free list. */
     struct cache_entry_s    *val_next;     /* Next entry in value-pointer bucket chain. */
-    struct cache_entry_s    *lru_next;     /* Next less-recently-used entry toward LRU tail. */
-    struct cache_entry_s    *lru_prev;     /* Previous more-recently-used entry toward MRU head. */
+    struct cache_entry_s    *lru_next;     /* Next less-recently-used entry toward segment tail. */
+    struct cache_entry_s    *lru_prev;     /* Previous more-recently-used entry toward segment head. */
 } cache_entry_t;
+
+/* Bucket slot storing independent heads for key hash chains and value hash chains. */
+typedef struct cache_bucket_s {
+    cache_entry_t          *key_head;              /* Head of key hash collision chain. */
+    cache_entry_t          *val_head;              /* Head of value-pointer hash collision chain. */
+} cache_bucket_t;
 
 /* Core cache container structure. */
 struct cache_s {
@@ -73,7 +85,7 @@ struct cache_s {
     os_unfair_lock          *locks;                 /* Array of stripe locks protecting key buckets. */
     size_t                   num_stripes;           /* Number of stripe locks (power of two). */
     size_t                   stripe_mask;           /* Bitwise stripe index mask (num_stripes - 1). */
-    os_unfair_lock           lru_lock;              /* Lock protecting LRU list, value index, and removed list. */
+    os_unfair_lock           lru_lock;              /* Lock protecting SLRU queues and value index. */
     cache_attributes_t       attrs;                 /* Configured cache attributes and callbacks. */
     _Atomic cache_cost_t     current_cost;          /* Aggregate cost of all active entries. */
     _Atomic size_t           current_count;         /* Total number of active entries. */
@@ -86,15 +98,17 @@ struct cache_s {
     dispatch_source_t        sim_pressure_source;   /* GCD simulated memory-pressure event source. */
     struct cache_s          *sim_next;              /* Next active cache in simulated pressure list. */
     _Atomic bool             is_destroying;         /* Flag indicating teardown is in progress. */
-    cache_entry_t          **buckets;               /* Key hash table bucket array. */
-    size_t                   bucket_count;          /* Number of key hash buckets (power of two). */
-    size_t                   bucket_mask;           /* Bitwise key bucket mask (bucket_count - 1). */
-    cache_entry_t          **val_buckets;           /* Value-pointer hash table bucket array. */
-    size_t                   val_bucket_count;      /* Number of value-pointer hash buckets (power of two). */
-    size_t                   val_bucket_mask;       /* Bitwise value bucket mask (val_bucket_count - 1). */
-    cache_entry_t           *head;                  /* Most-recently-used (MRU) entry at list head. */
-    cache_entry_t           *tail;                  /* Least-recently-used (LRU) entry at list tail. */
-    cache_entry_t           *removed_head;          /* Singly linked list of removed entries still retained. */
+    cache_bucket_t          *buckets;               /* Unified key and value hash table bucket array. */
+    size_t                   bucket_count;          /* Number of hash buckets (power of two). */
+    size_t                   bucket_mask;           /* Bitwise bucket mask (bucket_count - 1). */
+    cache_entry_t           *prob_head;             /* MRU entry at head of probationary segment. */
+    cache_entry_t           *prob_tail;             /* LRU entry at tail of probationary segment. */
+    size_t                   prob_count;            /* Count of active entries in probationary segment. */
+    cache_entry_t           *prot_head;             /* MRU entry at head of protected segment. */
+    cache_entry_t           *prot_tail;             /* LRU entry at tail of protected segment. */
+    size_t                   prot_count;            /* Count of active entries in protected segment. */
+    cache_entry_t           *head;                  /* Overall MRU entry alias. */
+    cache_entry_t           *tail;                  /* Overall LRU entry alias. */
 };
 
 /**
@@ -143,11 +157,16 @@ cache_unlock_lru(cache_t *cache)
     os_unfair_lock_unlock(&cache->lru_lock);
 }
 
-/* Internal helper functions for LRU list, value index, and eviction operations. */
+/* Internal helper functions for SLRU queues, value index, and eviction operations. */
 void detach_lru(cache_t *cache, cache_entry_t *entry);
+void attach_probation_head(cache_t *cache, cache_entry_t *entry);
+void attach_protected_head(cache_t *cache, cache_entry_t *entry);
 void attach_lru_head(cache_t *cache, cache_entry_t *entry);
+void touch_entry(cache_t *cache, cache_entry_t *entry);
 void attach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_val_bucket(cache_t *cache, cache_entry_t *entry);
+void detach_key_bucket(cache_t *cache, cache_entry_t *entry);
+void mark_entry_removed(cache_t *cache, cache_entry_t *entry);
 void free_entry_resources(cache_t *cache, cache_entry_t *entry);
 void detach_entry(cache_t *cache, cache_entry_t *entry);
 
