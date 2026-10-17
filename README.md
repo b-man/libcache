@@ -6,13 +6,17 @@ An open-source clone of Apple's libcache system library.
 Disclaimer: All public APIs (cache.h and cache_callbacks.h) are verified for
 correctness by building and running the unit test suite against Apple's
 libcache implementation. Private APIs (cache_private.h) are implemented on a
-best-effort basis and are not guaranteed to be correct.
+best-effort basis and are not guaranteed to be correct against Apple's libcache.
 
 Core Features
 -------------
 
 * Lock Striping: Distributes elements across independent shards to minimize
   multi-threaded lock contention.
+* Dynamic Memory-Proportional Capacity: Automatically manages cache capacity
+  proportional to system RAM without requiring callers to set manual count hints.
+* Adaptive Memory Pressure Scaling: Automatically shrinks cache capacity and evicts
+  unretained entries under memory pressure, restoring capacity when pressure normalizes.
 * Segmented LRU (SLRU) Eviction: Partitions cache queues into probationary and
   protected segments, ensuring recently and frequently accessed values are protected
   from being evicted by one-hit wonder scans.
@@ -22,6 +26,29 @@ Core Features
   locking retained entries from eviction.
 * Deterministic Hashing: Provides built-in 64-bit FNV-1a hashing for strings,
   integers, and fixed byte arrays.
+
+Dynamic Memory-Proportional Capacity Limits
+-------------------------------------------
+
+By default, callers are not required to configure manual count hints. The cache framework
+automatically calculates and manages dynamic capacity limits based on available physical memory:
+
+* **Baseline Sizing**: Probes physical system memory via Darwin's `sysctl({CTL_HW, HW_MEMSIZE})`
+  and establishes capacity at 1 entry per 64 KB of RAM (`CACHE_BYTES_PER_DYNAMIC_ENTRY`),
+  with a minimum baseline floor of 1,024 entries (`CACHE_MIN_DYNAMIC_CAPACITY_LIMIT`).
+* **Caller Hint Override**: If a caller explicitly configures `cache_set_count_hint(cache, limit)`,
+  the manual hint ceiling takes precedence. Setting the hint back to `0` restores automatic
+  dynamic capacity management.
+* **Kernel Memory Pressure Adaptation**:
+  - `DISPATCH_MEMORYPRESSURE_WARN`: Dynamically halves the capacity limit (floor of 128 entries,
+    `CACHE_MIN_WARN_CAPACITY_LIMIT`) and purges unretained entries.
+  - `DISPATCH_MEMORYPRESSURE_CRITICAL`: Reduces capacity to one-fourth of baseline (floor of 64
+    entries, `CACHE_MIN_CRITICAL_CAPACITY_LIMIT`), evicts unretained entries, and marks retained
+    purgeable entries volatile.
+  - `DISPATCH_MEMORYPRESSURE_NORMAL`: Restores dynamic capacity back to the full baseline limit as
+    memory pressure subsides.
+* **Diagnostics**: The active dynamic limit can be queried at runtime using the private API
+  `cache_get_dynamic_capacity_limit()` and is displayed in `cache_print_stats()`.
 
 Compilation and Verification
 ----------------------------

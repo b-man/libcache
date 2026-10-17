@@ -11,6 +11,8 @@
 #include <stdatomic.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
 
 #include "cache.h"
 #include "cache_internal.h"
@@ -85,6 +87,24 @@ cache_rehash_expand_internal(cache_t *cache)
     cache_unlock_stripes(cache);
 
     free(old_buckets);
+}
+
+/**
+ * @brief Queries total physical system memory in bytes.
+ * @return Total bytes of physical memory, or a fallback default if query fails.
+ */
+static uint64_t
+cache_query_physical_memory(void)
+{
+    uint64_t mem_bytes = 0;
+    int mib[2] = { CTL_HW, HW_MEMSIZE };
+    size_t len = sizeof(mem_bytes);
+
+    if (sysctl(mib, 2, &mem_bytes, &len, NULL, 0) != 0 || mem_bytes == 0) {
+        mem_bytes = CACHE_DEFAULT_PHYSICAL_MEMORY_BYTES;
+    }
+
+    return (mem_bytes);
 }
 
 /**
@@ -199,6 +219,16 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     atomic_init(&cache->ref_count, 1);
     atomic_init(&cache->is_destroying, false);
 
+    /* Initialize dynamic memory-proportional capacity limit */
+    {
+        uint64_t sys_mem = cache_query_physical_memory();
+        size_t dynamic_limit = (size_t)(sys_mem / CACHE_BYTES_PER_DYNAMIC_ENTRY);
+        if (dynamic_limit < CACHE_MIN_DYNAMIC_CAPACITY_LIMIT)
+            dynamic_limit = CACHE_MIN_DYNAMIC_CAPACITY_LIMIT;
+        cache->base_capacity_limit = dynamic_limit;
+        atomic_init(&cache->dynamic_capacity_limit, dynamic_limit);
+    }
+
     /* Create a serial queue targeting the low-priority global queue for memory-pressure events */
     monitor_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
     cache->monitor_queue = dispatch_queue_create("com.darwin.libcache.monitor",
@@ -248,7 +278,7 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
                     dispatch_source_get_data(sim_source);
                 pressure_flags = (dispatch_source_memorypressure_flags_t)raw_flags;
 
-                if (pressure_flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
+                if (pressure_flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | DISPATCH_MEMORYPRESSURE_NORMAL)) {
                     _cache_handle_memory_pressure_event(weak_cache, pressure_flags);
                 }
             };
@@ -418,9 +448,8 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
         cache_rehash_expand_internal(cache);
     }
 
-    /* Evict an unretained entry if count_hint is exceeded (SLRU: probationary tail first, then protected tail) */
-    count_limit = atomic_load_explicit(&cache->configured_count_hint,
-        memory_order_relaxed);
+    /* Evict an unretained entry if capacity limit is exceeded (SLRU: probationary tail first, then protected tail) */
+    count_limit = cache_get_effective_count_limit(cache);
     if (count_limit > 0 && live_count > count_limit) {
         cache_lock_lru(cache);
         

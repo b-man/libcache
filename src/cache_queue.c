@@ -144,8 +144,7 @@ touch_entry(cache_t *cache, cache_entry_t *entry)
     if (cache == NULL || entry == NULL)
         return;
 
-    count_limit = atomic_load_explicit(&cache->configured_count_hint,
-        memory_order_relaxed);
+    count_limit = cache_get_effective_count_limit(cache);
 
     if (entry->is_protected) {
         /* Already in protected segment: refresh to MRU head */

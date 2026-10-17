@@ -49,6 +49,7 @@ main(void)
     RUN_TEST(test_cache_private_release_multithreaded);
     RUN_TEST(test_cache_segmented_lru);
     RUN_TEST(test_cache_segmented_lru_demotion_and_eviction);
+    RUN_TEST(test_cache_dynamic_memory_proportional_capacity);
 #endif
 
     printf("\n========================================================================\n");

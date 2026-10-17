@@ -144,6 +144,24 @@ _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressu
     if (cache == NULL)
         return (EINVAL);
 
+    /* Dynamic memory-proportional capacity adjustment under memory pressure */
+    if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
+        size_t crit_limit = cache->base_capacity_limit / 4;
+        if (crit_limit < CACHE_MIN_CRITICAL_CAPACITY_LIMIT)
+            crit_limit = CACHE_MIN_CRITICAL_CAPACITY_LIMIT;
+        atomic_store_explicit(&cache->dynamic_capacity_limit, crit_limit,
+            memory_order_relaxed);
+    } else if (flags & DISPATCH_MEMORYPRESSURE_WARN) {
+        size_t warn_limit = cache->base_capacity_limit / 2;
+        if (warn_limit < CACHE_MIN_WARN_CAPACITY_LIMIT)
+            warn_limit = CACHE_MIN_WARN_CAPACITY_LIMIT;
+        atomic_store_explicit(&cache->dynamic_capacity_limit, warn_limit,
+            memory_order_relaxed);
+    } else if (flags & DISPATCH_MEMORYPRESSURE_NORMAL) {
+        atomic_store_explicit(&cache->dynamic_capacity_limit,
+            cache->base_capacity_limit, memory_order_relaxed);
+    }
+
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
 

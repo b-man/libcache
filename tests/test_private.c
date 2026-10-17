@@ -1484,3 +1484,85 @@ test_cache_segmented_lru_demotion_and_eviction(void)
 
     ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
 }
+
+/*
+ * Validates dynamic memory-proportional capacity limit initialization,
+ * automatic size control without manual caller hints, caller hint override,
+ * and capacity shrinkage under memory pressure with growth upon normalization.
+ */
+void
+test_cache_dynamic_memory_proportional_capacity(void)
+{
+    cache_t *cache = NULL;
+    cache_attributes_t attrs;
+    size_t count_hint = 0;
+    size_t dyn_limit = 0;
+    size_t dyn_limit_warn = 0;
+    size_t dyn_limit_norm = 0;
+    int status;
+    int i;
+
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.version = CACHE_ATTRIBUTES_VERSION_2;
+    attrs.key_hash_cb = cache_key_hash_cb_cstring;
+    attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
+    attrs.value_release_cb = cache_release_cb_free;
+
+    status = cache_create("com.darwin.test.dynamic.capacity", &attrs, &cache);
+    ASSERT_TRUE(status == 0 && cache != NULL,
+        "cache_create for dynamic memory-proportional test must succeed");
+
+    /* Caller did not set hints manually; configured_count_hint must be 0 */
+    ASSERT_TRUE(cache_get_count_hint(cache, &count_hint) == 0 && count_hint == 0,
+        "Initial manual count_hint must be 0 without caller setting hints");
+
+    /* Framework automatically initializes dynamic memory-proportional limit */
+    ASSERT_TRUE(cache_get_dynamic_capacity_limit(cache, &dyn_limit) == 0 && dyn_limit >= 1024,
+        "Dynamic capacity limit must be automatically initialized and proportional to system memory");
+
+    /* Validate error handling for invalid arguments */
+    ASSERT_TRUE(cache_get_dynamic_capacity_limit(NULL, &dyn_limit) == EINVAL,
+        "cache_get_dynamic_capacity_limit with NULL cache must return EINVAL");
+    ASSERT_TRUE(cache_get_dynamic_capacity_limit(cache, NULL) == EINVAL,
+        "cache_get_dynamic_capacity_limit with NULL limit_out must return EINVAL");
+
+    /* Verify caller can override automatic capacity by setting manual hint */
+    ASSERT_TRUE(cache_set_count_hint(cache, 100) == 0,
+        "Setting manual count_hint must succeed");
+    ASSERT_TRUE(cache_get_count_hint(cache, &count_hint) == 0 && count_hint == 100,
+        "cache_get_count_hint must return manual configured hint");
+
+    /* Reset manual hint back to 0 to restore automatic dynamic control */
+    ASSERT_TRUE(cache_set_count_hint(cache, 0) == 0,
+        "Resetting manual count_hint to 0 must succeed");
+    ASSERT_TRUE(cache_get_count_hint(cache, &count_hint) == 0 && count_hint == 0,
+        "cache_get_count_hint must return 0 after reset");
+
+    /* Simulate warning memory pressure: dynamic capacity limit must shrink */
+    ASSERT_TRUE(cache_simulate_memory_warning_event(DISPATCH_MEMORYPRESSURE_WARN) == 0,
+        "Simulating WARN memory pressure must succeed");
+    for (i = 0; i < 100; i++) {
+        if (cache_get_dynamic_capacity_limit(cache, &dyn_limit_warn) == 0 &&
+            dyn_limit_warn < dyn_limit) {
+            break;
+        }
+        usleep(1000);
+    }
+    ASSERT_TRUE(dyn_limit_warn < dyn_limit,
+        "Dynamic capacity limit must shrink under memory pressure");
+
+    /* Simulate memory normalization: dynamic capacity limit must grow back */
+    ASSERT_TRUE(cache_simulate_memory_warning_event(DISPATCH_MEMORYPRESSURE_NORMAL) == 0,
+        "Simulating NORMAL memory pressure must succeed");
+    for (i = 0; i < 100; i++) {
+        if (cache_get_dynamic_capacity_limit(cache, &dyn_limit_norm) == 0 &&
+            dyn_limit_norm == dyn_limit) {
+            break;
+        }
+        usleep(1000);
+    }
+    ASSERT_TRUE(dyn_limit_norm == dyn_limit,
+        "Dynamic capacity limit must grow back when system memory normalizes");
+
+    ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
+}

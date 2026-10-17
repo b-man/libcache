@@ -19,6 +19,21 @@
 /* Maximum number of hash table buckets permitted during rehash expansion. */
 #define CACHE_MAX_BUCKET_COUNT 65536
 
+/* Baseline default physical memory size (1 GB) used when sysctl probing fails. */
+#define CACHE_DEFAULT_PHYSICAL_MEMORY_BYTES (1024ULL * 1024 * 1024)
+
+/* Memory scaling denominator: allocates 1 cache entry per 64 KB of RAM (~16 entries/MB). */
+#define CACHE_BYTES_PER_DYNAMIC_ENTRY (64 * 1024)
+
+/* Minimum dynamic capacity limit for newly created cache instances. */
+#define CACHE_MIN_DYNAMIC_CAPACITY_LIMIT 1024
+
+/* Minimum capacity limit floor when operating under WARNING memory pressure. */
+#define CACHE_MIN_WARN_CAPACITY_LIMIT 128
+
+/* Minimum capacity limit floor when operating under CRITICAL memory pressure. */
+#define CACHE_MIN_CRITICAL_CAPACITY_LIMIT 64
+
 /* Maps a key hash value to its stripe lock pointer using stripe_mask. */
 #define GET_STRIPE_LOCK(cache, hash_val) \
     (&((cache)->locks[(hash_val) & (cache)->stripe_mask]))
@@ -90,7 +105,9 @@ struct cache_s {
     _Atomic cache_cost_t     current_cost;          /* Aggregate cost of all active entries. */
     _Atomic size_t           current_count;         /* Total number of active entries. */
     _Atomic size_t           minimum_values_hint;   /* Configured minimum values hint. */
-    _Atomic size_t           configured_count_hint; /* Configured maximum entry count ceiling. */
+    _Atomic size_t           configured_count_hint; /* Configured maximum entry count ceiling (0 = automatic). */
+    _Atomic size_t           dynamic_capacity_limit;/* Dynamic memory-proportional capacity limit. */
+    size_t                   base_capacity_limit;   /* Baseline dynamic capacity limit at normal memory. */
     _Atomic uint32_t         ref_count;             /* Reference count for cache descriptor lifecycle. */
     malloc_zone_t           *memory_zone;           /* Backing malloc zone for cache_entry_t allocations. */
     dispatch_queue_t         monitor_queue;         /* Serial dispatch queue for memory-pressure events. */
@@ -155,6 +172,31 @@ static inline void
 cache_unlock_lru(cache_t *cache)
 {
     os_unfair_lock_unlock(&cache->lru_lock);
+}
+
+/**
+ * @brief Returns the effective entry count limit for the cache.
+ * @details If a manual count hint is configured by the caller (configured_count_hint > 0),
+ *          that manual hint takes precedence. Otherwise, the dynamic memory-proportional
+ *          capacity limit is used so the framework automatically controls cache size.
+ * @param cache A valid cache instance.
+ * @return Effective entry count ceiling.
+ */
+static inline size_t
+cache_get_effective_count_limit(const cache_t *cache)
+{
+    size_t configured;
+
+    if (cache == NULL)
+        return (0);
+
+    configured = atomic_load_explicit(&cache->configured_count_hint,
+        memory_order_relaxed);
+    if (configured > 0)
+        return (configured);
+
+    return atomic_load_explicit(&cache->dynamic_capacity_limit,
+        memory_order_relaxed);
 }
 
 /* Internal helper functions for SLRU queues, value index, and eviction operations. */

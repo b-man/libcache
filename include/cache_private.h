@@ -11,7 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <dispatch/source.h>
 
-#include <cache.h>
+#include "cache.h"
 
 #if defined(CACHE_PRIVATE) && (defined(__GNUC__) || defined(__clang__))
     #define CACHE_PRIVATE_API __attribute__((visibility("default")))
@@ -78,6 +78,15 @@ CACHE_PRIVATE_API int cache_get_cost_hint(cache_t *cache, void *key,
  * @return 0 on success, or EINVAL on invalid arguments.
  */
 CACHE_PRIVATE_API int cache_get_count_hint(cache_t *cache, size_t *count_out);
+
+/**
+ * @brief Retrieves the dynamic memory-proportional capacity limit.
+ * @param cache Target cache instance.
+ * @param limit_out Output pointer receiving the dynamic capacity limit.
+ * @return 0 on success, or EINVAL on invalid arguments.
+ */
+CACHE_PRIVATE_API int cache_get_dynamic_capacity_limit(cache_t *cache,
+    size_t *limit_out);
 
 /**
  * @brief Retrieves the configured minimum values hint.

@@ -58,6 +58,7 @@ void test_cache_private_release(void);
 void test_cache_private_release_multithreaded(void);
 void test_cache_segmented_lru(void);
 void test_cache_segmented_lru_demotion_and_eviction(void);
+void test_cache_dynamic_memory_proportional_capacity(void);
 #endif
 
 #endif /* !_TEST_SUITE_H_ */
