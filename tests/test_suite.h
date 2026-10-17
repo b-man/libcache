@@ -57,6 +57,7 @@ void test_private_simulate_memory_warning(void);
 void test_cache_private_release(void);
 void test_cache_private_release_multithreaded(void);
 void test_cache_segmented_lru(void);
+void test_cache_segmented_lru_demotion_and_eviction(void);
 #endif
 
 #endif /* !_TEST_SUITE_H_ */

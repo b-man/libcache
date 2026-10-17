@@ -1347,3 +1347,140 @@ test_cache_segmented_lru(void)
     ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
 }
 
+/*
+ * Validates that when promotion causes the protected segment to exceed its
+ * capacity ceiling, its LRU tail entry is demoted back to the MRU head of the
+ * probationary segment and is eventually evicted under cache pressure.
+ */
+void
+test_cache_segmented_lru_demotion_and_eviction(void)
+{
+    cache_t *cache = NULL;
+    cache_attributes_t attrs;
+    cache_entry_info_t info;
+    void *val_out = NULL;
+    int status;
+
+    memset(&attrs, 0, sizeof(attrs));
+    attrs.version = CACHE_ATTRIBUTES_VERSION_2;
+    attrs.key_hash_cb = cache_key_hash_cb_cstring;
+    attrs.key_is_equal_cb = cache_key_is_equal_cb_cstring;
+    attrs.value_release_cb = cache_release_cb_free;
+
+    status = cache_create("com.test.slru.demotion", &attrs, &cache);
+    ASSERT_TRUE(status == 0 && cache != NULL,
+        "cache_create for SLRU demotion test must succeed");
+
+    /*
+     * Configure count_hint = 6.
+     * Protected segment capacity limit is computed as:
+     *   prot_limit = (count_limit * 4) / 5 = (6 * 4) / 5 = 4.
+     * Thus, the protected segment can hold at most 4 entries before overflowing.
+     */
+    status = cache_set_count_hint(cache, 6);
+    ASSERT_TRUE(status == 0, "cache_set_count_hint must return 0");
+
+    char *v1 = strdup("val_1");
+    char *v2 = strdup("val_2");
+    char *v3 = strdup("val_3");
+    char *v4 = strdup("val_4");
+    char *v_older = strdup("val_older");
+    char *v_cand = strdup("val_cand");
+    char *v_new1 = strdup("val_new1");
+    char *v_new2 = strdup("val_new2");
+
+    /* Insert and promote 4 entries into the protected segment */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k1", v1, 10) == 0, "Insert k1 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v1) == 0, "Release k1 must succeed");
+    ASSERT_TRUE(cache_get(cache, "k1", &val_out) == 0 && val_out == v1, "Promote k1 to protected");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "k2", v2, 10) == 0, "Insert k2 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v2) == 0, "Release k2 must succeed");
+    ASSERT_TRUE(cache_get(cache, "k2", &val_out) == 0 && val_out == v2, "Promote k2 to protected");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "k3", v3, 10) == 0, "Insert k3 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v3) == 0, "Release k3 must succeed");
+    ASSERT_TRUE(cache_get(cache, "k3", &val_out) == 0 && val_out == v3, "Promote k3 to protected");
+
+    ASSERT_TRUE(cache_set_and_retain(cache, "k4", v4, 10) == 0, "Insert k4 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v4) == 0, "Release k4 must succeed");
+    ASSERT_TRUE(cache_get(cache, "k4", &val_out) == 0 && val_out == v4, "Promote k4 to protected");
+
+    /*
+     * At this point:
+     * Protected segment is at capacity ceiling (4 entries):
+     *   MRU: k4 -> k3 -> k2 -> k1 (LRU tail)
+     * k1 is the oldest (LRU) entry in the protected segment.
+     */
+
+    /* Insert an older unpromoted entry into the probationary segment */
+    ASSERT_TRUE(cache_set_and_retain(cache, "p_older", v_older, 10) == 0, "Insert p_older must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v_older) == 0, "Release p_older must succeed");
+
+    /* Insert candidate entry into probationary segment */
+    ASSERT_TRUE(cache_set_and_retain(cache, "p_cand", v_cand, 10) == 0, "Insert p_cand must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v_cand) == 0, "Release p_cand must succeed");
+
+    /*
+     * Cache currently has 6 entries (total limit = 6, so no evictions yet):
+     *   Protected (4): k4, k3, k2, k1 (tail)
+     *   Probationary (2): p_cand (MRU) -> p_older (LRU tail)
+     */
+
+    /*
+     * Promote p_cand to protected segment by accessing it.
+     * This increases protected count to 5, exceeding the protected ceiling of 4.
+     * SLRU demotion rule MUST trigger:
+     *   The LRU tail of the protected segment (k1) is demoted back to the
+     *   MRU head of the probationary segment.
+     */
+    val_out = NULL;
+    ASSERT_TRUE(cache_get(cache, "p_cand", &val_out) == 0 && val_out == v_cand,
+        "Promoting p_cand to protected segment must succeed");
+
+    /*
+     * Verify k1 was demoted to the MRU head of the probationary segment:
+     * The probationary segment now contains:
+     *   k1 (MRU head from demotion) -> p_older (LRU tail)
+     *
+     * Verify k1 is still alive in the cache (demotion does not evict it).
+     */
+    memset(&info, 0, sizeof(info));
+    ASSERT_TRUE(cache_get_info_for_key(cache, "k1", &info) == 0,
+        "Demoted entry k1 must still be resident in the cache");
+
+    /*
+     * Insert k_new1 to exceed total cache capacity (7 > 6).
+     * Eviction selects from the LRU tail of the probationary segment.
+     * Because k1 was demoted to the MRU head of probationary, p_older is at
+     * the LRU tail and MUST be evicted first!
+     */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k_new1", v_new1, 10) == 0, "Insert k_new1 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v_new1) == 0, "Release k_new1 must succeed");
+
+    ASSERT_TRUE(cache_get(cache, "p_older", &val_out) == ENOENT,
+        "p_older at probationary tail must be evicted before demoted entry k1");
+    ASSERT_TRUE(cache_get_info_for_key(cache, "k1", &info) == 0,
+        "Demoted entry k1 must survive eviction of p_older because it entered at MRU head");
+
+    /*
+     * Now, insert k_new2 to exceed total cache capacity again (7 > 6).
+     * k_new1 is at probationary MRU head, making demoted k1 the new LRU tail of probationary.
+     * Thus, k1 MUST eventually be evicted!
+     */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k_new2", v_new2, 10) == 0, "Insert k_new2 must succeed");
+    ASSERT_TRUE(cache_release_value(cache, v_new2) == 0, "Release k_new2 must succeed");
+
+    ASSERT_TRUE(cache_get(cache, "k1", &val_out) == ENOENT,
+        "Demoted entry k1 at probationary tail must eventually be evicted");
+
+    /* Verify protected entries and newly added probationary entries remain intact */
+    ASSERT_TRUE(cache_get(cache, "p_cand", &val_out) == 0 && val_out == v_cand, "p_cand must remain");
+    ASSERT_TRUE(cache_get(cache, "k4", &val_out) == 0 && val_out == v4, "k4 must remain");
+    ASSERT_TRUE(cache_get(cache, "k3", &val_out) == 0 && val_out == v3, "k3 must remain");
+    ASSERT_TRUE(cache_get(cache, "k2", &val_out) == 0 && val_out == v2, "k2 must remain");
+    ASSERT_TRUE(cache_get(cache, "k_new1", &val_out) == 0 && val_out == v_new1, "k_new1 must remain");
+    ASSERT_TRUE(cache_get(cache, "k_new2", &val_out) == 0 && val_out == v_new2, "k_new2 must remain");
+
+    ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
+}
