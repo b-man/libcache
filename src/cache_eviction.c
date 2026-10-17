@@ -138,59 +138,56 @@ free_entry_resources(cache_t *cache, cache_entry_t *entry)
 int
 _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressure_flags_t flags)
 {
+    dispatch_source_memorypressure_flags_t allowed_mask;
     cache_entry_t *curr, *next_entry;
-    size_t b, active_capacity;
+    size_t b, active_capacity, limit;
 
     if (cache == NULL)
         return (EINVAL);
 
+    allowed_mask = DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN |
+                   DISPATCH_MEMORYPRESSURE_CRITICAL;
+
+    if (flags == 0 || (flags & ~allowed_mask) != 0)
+        return (EINVAL);
+
     /* Dynamic memory-proportional capacity adjustment under memory pressure */
+    limit = cache->base_capacity_limit;
     if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
-        size_t crit_limit = cache->base_capacity_limit / 4;
-        if (crit_limit < CACHE_MIN_CRITICAL_CAPACITY_LIMIT)
-            crit_limit = CACHE_MIN_CRITICAL_CAPACITY_LIMIT;
-        atomic_store_explicit(&cache->dynamic_capacity_limit, crit_limit,
-            memory_order_relaxed);
+        limit = (limit / 4 < CACHE_MIN_CRITICAL_CAPACITY_LIMIT) ?
+            CACHE_MIN_CRITICAL_CAPACITY_LIMIT : limit / 4;
     } else if (flags & DISPATCH_MEMORYPRESSURE_WARN) {
-        size_t warn_limit = cache->base_capacity_limit / 2;
-        if (warn_limit < CACHE_MIN_WARN_CAPACITY_LIMIT)
-            warn_limit = CACHE_MIN_WARN_CAPACITY_LIMIT;
-        atomic_store_explicit(&cache->dynamic_capacity_limit, warn_limit,
-            memory_order_relaxed);
-    } else if (flags & DISPATCH_MEMORYPRESSURE_NORMAL) {
-        atomic_store_explicit(&cache->dynamic_capacity_limit,
-            cache->base_capacity_limit, memory_order_relaxed);
+        limit = (limit / 2 < CACHE_MIN_WARN_CAPACITY_LIMIT) ?
+            CACHE_MIN_WARN_CAPACITY_LIMIT : limit / 2;
     }
+    atomic_store_explicit(&cache->dynamic_capacity_limit, limit,
+        memory_order_relaxed);
+
+    /* Only warning and critical memory pressure require scanning and evicting entries */
+    if (!(flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)))
+        return (0);
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
 
     active_capacity = cache->bucket_count;
 
-    /* Scan all key buckets for unretained or purgeable entries */
+    /* Scan all key buckets to evict unretained entries or mark values purgeable */
     for (b = 0; b < active_capacity; b++) {
         curr = cache->buckets[b].key_head;
 
         while (curr != NULL) {
             next_entry = curr->next;
 
-            /* Evict unretained entries under warning or critical memory pressure */
             if (curr->retain_count == 0) {
-                if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL)) {
-                    detach_entry(cache, curr);
-                    free_entry_resources(cache, curr);
-                    curr = next_entry;
-                    continue;
-                }
-            } else {
-                /* Under critical pressure, mark retained values as purgeable if supported */
-                if (flags & DISPATCH_MEMORYPRESSURE_CRITICAL) {
-                    if (cache->attrs.value_make_purgeable_cb != NULL) {
-                        cache->attrs.value_make_purgeable_cb(curr->value,
-                            cache->attrs.user_data);
-                    }
-                }
+                detach_entry(cache, curr);
+                free_entry_resources(cache, curr);
+            } else if ((flags & DISPATCH_MEMORYPRESSURE_CRITICAL) &&
+                       cache->attrs.value_make_purgeable_cb != NULL) {
+                cache->attrs.value_make_purgeable_cb(curr->value,
+                    cache->attrs.user_data);
             }
+
             curr = next_entry;
         }
     }
