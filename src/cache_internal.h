@@ -34,9 +34,18 @@
 /* Minimum capacity limit floor when operating under CRITICAL memory pressure. */
 #define CACHE_MIN_CRITICAL_CAPACITY_LIMIT 64
 
+/* Target CPU cache line size to prevent false sharing under high concurrency. */
+#define CACHE_LINE_SIZE 64
+
+/* Cache-line padded stripe lock preventing false sharing across concurrent buckets. */
+typedef struct {
+    os_unfair_lock lock;
+    uint8_t        pad[CACHE_LINE_SIZE - sizeof(os_unfair_lock)];
+} cache_stripe_lock_t;
+
 /* Maps a key hash value to its stripe lock pointer using stripe_mask. */
 #define GET_STRIPE_LOCK(cache, hash_val) \
-    (&((cache)->locks[(hash_val) & (cache)->stripe_mask]))
+    (&((cache)->locks[(hash_val) & (cache)->stripe_mask].lock))
 
 /* Maps a key hash value to its key hash bucket head using bucket_mask. */
 #define GET_KEY_BUCKET(cache, hash_val) \
@@ -46,15 +55,21 @@
 #define GET_VAL_BUCKET(cache, hash_val) \
     ((cache)->buckets[(hash_val) & (cache)->bucket_mask].val_head)
 
+/* Maps a value hash value to its stripe lock pointer using stripe_mask. */
+#define GET_VAL_STRIPE_LOCK(cache, val_hash) \
+    (&((cache)->val_locks[(val_hash) & (cache)->stripe_mask].lock))
+
 /* Computes the hash value for a key using the configured key_hash_cb. */
 #define CACHE_KEY_HASH(cache, key) \
     ((cache)->attrs.key_hash_cb((key), (cache)->attrs.user_data))
 
-/* Evaluates whether a cache entry matches the specified key and hash value. */
+/* Evaluates whether a cache entry matches the specified key and hash value.
+ * Uses pointer equality shortcut to bypass callback for identical/integer keys. */
 #define CACHE_KEY_MATCH(cache, entry, key, hash_val) \
     ((entry)->key_hash == (hash_val) && \
-     (cache)->attrs.key_is_equal_cb((entry)->key, (key), \
-     (cache)->attrs.user_data))
+     ((entry)->key == (key) || \
+      (cache)->attrs.key_is_equal_cb((entry)->key, (key), \
+      (cache)->attrs.user_data)))
 
 /**
  * @brief Computes a 64-bit hash mix of a pointer address for O(1)
@@ -79,7 +94,7 @@ typedef struct cache_entry_s {
     void                    *value;        /* Entry value pointer. */
     uintptr_t                key_hash;     /* Cached key hash value. */
     cache_cost_t             cost;         /* Entry cost weight. */
-    int                      retain_count; /* Reference count; prevents eviction when > 0. */
+    _Atomic int              retain_count; /* Reference count; prevents eviction when > 0. */
     bool                     is_removed;   /* True if entry was unlinked from cache while still retained. */
     bool                     is_protected; /* True if entry is in protected segment; false if probationary. */
     struct cache_entry_s    *next;         /* Next entry in key bucket or free list. */
@@ -97,10 +112,12 @@ typedef struct cache_bucket_s {
 /* Core cache container structure. */
 struct cache_s {
     char                    *name;                  /* Descriptive cache name string. */
-    os_unfair_lock          *locks;                 /* Array of stripe locks protecting key buckets. */
+    cache_stripe_lock_t     *locks;                 /* Array of cache-line padded stripe locks for key buckets. */
+    cache_stripe_lock_t     *val_locks;             /* Array of cache-line padded stripe locks for value buckets. */
     size_t                   num_stripes;           /* Number of stripe locks (power of two). */
     size_t                   stripe_mask;           /* Bitwise stripe index mask (num_stripes - 1). */
-    os_unfair_lock           lru_lock;              /* Lock protecting SLRU queues and value index. */
+    _Alignas(CACHE_LINE_SIZE) os_unfair_lock lru_lock; /* Lock protecting SLRU queues. */
+    uint8_t                  _lru_pad[CACHE_LINE_SIZE - sizeof(os_unfair_lock)];
     cache_attributes_t       attrs;                 /* Configured cache attributes and callbacks. */
     _Atomic cache_cost_t     current_cost;          /* Aggregate cost of all active entries. */
     _Atomic size_t           current_count;         /* Total number of active entries. */
@@ -108,7 +125,10 @@ struct cache_s {
     _Atomic size_t           configured_count_hint; /* Configured maximum entry count ceiling (0 = automatic). */
     _Atomic size_t           dynamic_capacity_limit;/* Dynamic memory-proportional capacity limit. */
     size_t                   base_capacity_limit;   /* Baseline dynamic capacity limit at normal memory. */
+    _Atomic uint32_t         user_ref_count;        /* Reference count for user descriptor handle. */
     _Atomic uint32_t         ref_count;             /* Reference count for cache descriptor lifecycle. */
+    size_t                   total_retained_entries;/* Total active retained entries; protected by lru_lock. */
+    _Atomic bool             deferred_destroy;      /* True if cache_release was called while entries were retained. */
     malloc_zone_t           *memory_zone;           /* Backing malloc zone for cache_entry_t allocations. */
     dispatch_queue_t         monitor_queue;         /* Serial dispatch queue for memory-pressure events. */
     dispatch_source_t        mem_pressure_source;   /* GCD memory-pressure event source. */
@@ -138,7 +158,7 @@ cache_lock_stripes(cache_t *cache)
     ssize_t i;
 
     for (i = 0; i < (ssize_t)cache->num_stripes; i++)
-        os_unfair_lock_lock(&cache->locks[i]);
+        os_unfair_lock_lock(&cache->locks[i].lock);
 }
 
 /**
@@ -151,7 +171,33 @@ cache_unlock_stripes(cache_t *cache)
     ssize_t i;
 
     for (i = (ssize_t)cache->num_stripes - 1; i >= 0; i--)
-        os_unfair_lock_unlock(&cache->locks[i]);
+        os_unfair_lock_unlock(&cache->locks[i].lock);
+}
+
+/**
+ * @brief Acquires all value stripe locks in ascending index order.
+ * @param cache A valid cache instance.
+ */
+static inline void
+cache_lock_val_stripes(cache_t *cache)
+{
+    ssize_t i;
+
+    for (i = 0; i < (ssize_t)cache->num_stripes; i++)
+        os_unfair_lock_lock(&cache->val_locks[i].lock);
+}
+
+/**
+ * @brief Releases all value stripe locks in descending index order.
+ * @param cache A valid cache instance.
+ */
+static inline void
+cache_unlock_val_stripes(cache_t *cache)
+{
+    ssize_t i;
+
+    for (i = (ssize_t)cache->num_stripes - 1; i >= 0; i--)
+        os_unfair_lock_unlock(&cache->val_locks[i].lock);
 }
 
 /**
@@ -182,38 +228,22 @@ cache_unlock_lru(cache_t *cache)
  * @param cache A valid cache instance.
  * @return Effective entry count ceiling.
  */
-static inline size_t
-cache_get_effective_count_limit(const cache_t *cache)
-{
-    size_t configured;
-
-    if (cache == NULL)
-        return (0);
-
-    configured = atomic_load_explicit(&cache->configured_count_hint,
-        memory_order_relaxed);
-    if (configured > 0)
-        return (configured);
-
-    return atomic_load_explicit(&cache->dynamic_capacity_limit,
-        memory_order_relaxed);
-}
+size_t cache_get_effective_count_limit(const cache_t *cache);
 
 /* Internal helper functions for SLRU queues, value index, and eviction operations. */
-void detach_lru(cache_t *cache, cache_entry_t *entry);
+void detach(cache_t *cache, cache_entry_t *entry);
 void attach_probation_head(cache_t *cache, cache_entry_t *entry);
 void attach_protected_head(cache_t *cache, cache_entry_t *entry);
-void attach_lru_head(cache_t *cache, cache_entry_t *entry);
-void touch_entry(cache_t *cache, cache_entry_t *entry);
+void touch(cache_t *cache, cache_entry_t *entry);
 void attach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_key_bucket(cache_t *cache, cache_entry_t *entry);
 void mark_entry_removed(cache_t *cache, cache_entry_t *entry);
 void free_entry_resources(cache_t *cache, cache_entry_t *entry);
 void detach_entry(cache_t *cache, cache_entry_t *entry);
-
-int _cache_handle_memory_pressure_event(cache_t *cache, dispatch_source_memorypressure_flags_t flags);
 void _cache_sim_pressure_enroll(cache_t *cache);
 void _cache_sim_pressure_unenroll(cache_t *cache);
+void cache_init_memory_pressure_monitor(cache_t *cache);
+void cache_teardown_memory_pressure_monitor(cache_t *cache);
 
 #endif /* !_CACHE_INTERNAL_H_ */

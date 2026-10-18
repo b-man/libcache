@@ -33,8 +33,17 @@ cache_key_hash_cb_cstring(void *key, void *unused)
     if (str == NULL || *str == '\0')
         return (0);
 
+    /* Unroll 4 bytes when available to reduce loop branches */
+    while (str[0] && str[1] && str[2] && str[3]) {
+        hash = (hash ^ (uint64_t)str[0]) * FNV1A_64_PRIME;
+        hash = (hash ^ (uint64_t)str[1]) * FNV1A_64_PRIME;
+        hash = (hash ^ (uint64_t)str[2]) * FNV1A_64_PRIME;
+        hash = (hash ^ (uint64_t)str[3]) * FNV1A_64_PRIME;
+        str += 4;
+    }
+
     while (*str) {
-        hash ^= *str++;
+        hash ^= (uint64_t)*str++;
         hash *= FNV1A_64_PRIME;
     }
 
@@ -73,10 +82,14 @@ cache_key_hash_cb_integer(void *key, void *unused)
     uint64_t hash = FNV1A_64_OFFSET_BASIS;
     const uint8_t *bytes = (const uint8_t *)&key;
 
-    for (size_t i = 0; i < sizeof(key); i++) {
-        hash ^= bytes[i];
-        hash *= FNV1A_64_PRIME;
-    }
+    hash = (hash ^ (uint64_t)bytes[0]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[1]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[2]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[3]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[4]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[5]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[6]) * FNV1A_64_PRIME;
+    hash = (hash ^ (uint64_t)bytes[7]) * FNV1A_64_PRIME;
 
     return ((uintptr_t)hash);
 }

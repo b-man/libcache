@@ -17,7 +17,7 @@
  * @param entry Entry node to detach from the SLRU segment queue.
  */
 void
-detach_lru(cache_t *cache, cache_entry_t *entry)
+detach(cache_t *cache, cache_entry_t *entry)
 {
     if (cache == NULL || entry == NULL)
         return;
@@ -112,17 +112,6 @@ attach_protected_head(cache_t *cache, cache_entry_t *entry)
     cache->tail = cache->prob_tail ? cache->prob_tail : cache->prot_tail;
 }
 
-/**
- * @brief Compatibility wrapper inserting at the probationary head.
- * @details Caller must hold cache->lru_lock.
- * @param cache A valid cache instance.
- * @param entry Entry node to insert.
- */
-void
-attach_lru_head(cache_t *cache, cache_entry_t *entry)
-{
-    attach_probation_head(cache, entry);
-}
 
 /**
  * @brief Promotes an accessed entry according to Segmented LRU (SLRU) rules.
@@ -136,71 +125,127 @@ attach_lru_head(cache_t *cache, cache_entry_t *entry)
  * @param entry Entry node that was accessed on a cache hit.
  */
 void
-touch_entry(cache_t *cache, cache_entry_t *entry)
+touch(cache_t *cache, cache_entry_t *entry)
 {
     size_t count_limit, prot_limit;
     cache_entry_t *demote_node;
 
-    if (cache == NULL || entry == NULL)
+    if (cache == NULL || entry == NULL || entry->is_removed)
         return;
 
-    count_limit = cache_get_effective_count_limit(cache);
-
     if (entry->is_protected) {
-        /* Already in protected segment: refresh to MRU head */
-        if (cache->prot_head != entry) {
-            detach_lru(cache, entry);
-            attach_protected_head(cache, entry);
-        }
-    } else {
-        /* In probationary segment: promote on second access to protected segment */
-        detach_lru(cache, entry);
+        /* Fast path: entry is already at the protected MRU head */
+        if (cache->prot_head == entry)
+            return;
+
+        /* Already protected: move to MRU head without changing prot_count */
+        detach(cache, entry);
         attach_protected_head(cache, entry);
+        return;
     }
 
-    /* Enforce protected segment capacity if a count limit is configured */
+    /* In probationary segment: promote to protected segment */
+    detach(cache, entry);
+    attach_protected_head(cache, entry);
+
+    /* Enforce protected segment capacity only upon probationary promotion */
+    count_limit = cache_get_effective_count_limit(cache);
     if (count_limit > 0) {
         prot_limit = (count_limit * 4) / 5;
-        if (prot_limit == 0 && count_limit > 0)
+        if (prot_limit == 0)
             prot_limit = 1;
-        if (prot_limit >= count_limit)
+        else if (prot_limit >= count_limit)
             prot_limit = count_limit - 1;
 
         /* Demote excess entries from protected tail to probationary head */
         while (cache->prot_count > prot_limit && cache->prot_tail != NULL) {
             demote_node = cache->prot_tail;
-            detach_lru(cache, demote_node);
+            detach(cache, demote_node);
             attach_probation_head(cache, demote_node);
         }
     }
 }
 
 /**
+ * @brief Unlinks an entry from its key hash bucket collision chain.
+ * @details Caller must hold the stripe lock protecting entry->key_hash.
+ * @param cache A valid cache instance.
+ * @param entry Entry node to unlink from the key hash bucket.
+ */
+void
+detach_key_bucket(cache_t *cache, cache_entry_t *entry)
+{
+    cache_entry_t *curr, *prev;
+
+    if (cache == NULL || entry == NULL)
+        return;
+
+    curr = GET_KEY_BUCKET(cache, entry->key_hash);
+    prev = NULL;
+    while (curr != NULL) {
+        if (curr == entry) {
+            if (prev != NULL)
+                prev->next = curr->next;
+            else
+                GET_KEY_BUCKET(cache, entry->key_hash) = curr->next;
+            curr->next = NULL;
+            break;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
+/**
  * @brief Inserts an active entry into the value-pointer hash index.
- * @details Caller must hold cache->lru_lock.
+ * @details Synchronized via the value stripe lock covering entry->value.
  * @param cache A valid cache instance.
  * @param entry Entry node to index by its value pointer.
  */
 void
 attach_val_bucket(cache_t *cache, cache_entry_t *entry)
 {
-    size_t slot = cache_hash_pointer(entry->value) & cache->bucket_mask;
+    size_t val_hash;
+    size_t slot;
+    os_unfair_lock_t val_lock;
+
+    if (cache == NULL || entry == NULL)
+        return;
+
+    val_hash = cache_hash_pointer(entry->value);
+    slot = val_hash & cache->bucket_mask;
+    val_lock = GET_VAL_STRIPE_LOCK(cache, val_hash);
+
+    os_unfair_lock_lock(val_lock);
     entry->val_next = cache->buckets[slot].val_head;
     cache->buckets[slot].val_head = entry;
+    os_unfair_lock_unlock(val_lock);
 }
 
 /**
  * @brief Removes an entry from the value-pointer hash index.
- * @details Caller must hold cache->lru_lock.
+ * @details Synchronized via the value stripe lock covering entry->value.
  * @param cache A valid cache instance.
  * @param entry Entry node to unlink from the value-pointer hash index.
  */
 void
 detach_val_bucket(cache_t *cache, cache_entry_t *entry)
 {
-    size_t slot = cache_hash_pointer(entry->value) & cache->bucket_mask;
-    cache_entry_t *curr = cache->buckets[slot].val_head;
-    cache_entry_t *prev = NULL;
+    size_t val_hash;
+    size_t slot;
+    os_unfair_lock_t val_lock;
+    cache_entry_t *curr, *prev;
+
+    if (cache == NULL || entry == NULL)
+        return;
+
+    val_hash = cache_hash_pointer(entry->value);
+    slot = val_hash & cache->bucket_mask;
+    val_lock = GET_VAL_STRIPE_LOCK(cache, val_hash);
+
+    os_unfair_lock_lock(val_lock);
+    curr = cache->buckets[slot].val_head;
+    prev = NULL;
 
     while (curr != NULL) {
         if (curr == entry) {
@@ -209,9 +254,10 @@ detach_val_bucket(cache_t *cache, cache_entry_t *entry)
             else
                 cache->buckets[slot].val_head = curr->val_next;
             curr->val_next = NULL;
-            return;
+            break;
         }
         prev = curr;
         curr = curr->val_next;
     }
+    os_unfair_lock_unlock(val_lock);
 }

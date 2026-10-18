@@ -43,9 +43,11 @@ cache_rehash_expand_internal(cache_t *cache)
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
 
     /* Abort if another thread already expanded the table while waiting for locks */
     if (cache->bucket_count != old_count) {
+        cache_unlock_val_stripes(cache);
         cache_unlock_lru(cache);
         cache_unlock_stripes(cache);
         free(new_buckets);
@@ -83,6 +85,7 @@ cache_rehash_expand_internal(cache_t *cache)
     cache->bucket_count = new_count;
     cache->bucket_mask = new_mask;
 
+    cache_unlock_val_stripes(cache);
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
@@ -108,6 +111,31 @@ cache_query_physical_memory(void)
 }
 
 /**
+ * @brief Returns the effective entry count limit for the cache.
+ * @details If a manual count hint is configured by the caller (configured_count_hint > 0),
+ *          that manual hint takes precedence. Otherwise, the dynamic memory-proportional
+ *          capacity limit is used so the framework automatically controls cache size.
+ * @param cache A valid cache instance.
+ * @return Effective entry count ceiling.
+ */
+size_t
+cache_get_effective_count_limit(const cache_t *cache)
+{
+    size_t configured;
+
+    if (cache == NULL)
+        return (0);
+
+    configured = atomic_load_explicit(&cache->configured_count_hint,
+        memory_order_relaxed);
+    if (configured > 0)
+        return (configured);
+
+    return atomic_load_explicit(&cache->dynamic_capacity_limit,
+        memory_order_relaxed);
+}
+
+/**
  * @brief Creates and initializes a new cache instance with the specified
  *        attributes and callbacks.
  * @details Normalizes attribute version (falling through and assuming
@@ -127,8 +155,8 @@ CACHE_PUBLIC_API int
 cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
 {
     cache_t *cache;
-    dispatch_queue_t monitor_queue;
-    size_t initial_hint;
+    size_t initial_hint, dynamic_limit;
+    uint64_t sys_mem;
     int i, ncpu;
 
     if (name == NULL || cache_out == NULL || attrs == NULL)
@@ -157,15 +185,24 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     cache->num_stripes <<= 1;
     cache->stripe_mask = cache->num_stripes - 1;
 
-    /* Allocate and initialize stripe locks and the LRU lock */
-    cache->locks = calloc(cache->num_stripes, sizeof(os_unfair_lock));
+    /* Allocate and initialize stripe locks, value stripe locks, and the LRU lock */
+    cache->locks = calloc(cache->num_stripes, sizeof(cache_stripe_lock_t));
     if (cache->locks == NULL) {
         free(cache->name);
         free(cache);
         return (ENOMEM);
     }
-    for (i = 0; i < (int)cache->num_stripes; i++)
-        cache->locks[i] = OS_UNFAIR_LOCK_INIT;
+    cache->val_locks = calloc(cache->num_stripes, sizeof(cache_stripe_lock_t));
+    if (cache->val_locks == NULL) {
+        free(cache->locks);
+        free(cache->name);
+        free(cache);
+        return (ENOMEM);
+    }
+    for (i = 0; i < (int)cache->num_stripes; i++) {
+        cache->locks[i].lock = OS_UNFAIR_LOCK_INIT;
+        cache->val_locks[i].lock = OS_UNFAIR_LOCK_INIT;
+    }
 
     cache->lru_lock = OS_UNFAIR_LOCK_INIT;
 
@@ -194,9 +231,9 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     /* Bind cache entry allocations to the default purgeable malloc zone */
     cache->memory_zone = malloc_default_purgeable_zone();
 
-    /* Size initial hash tables as a power of two at least as large as num_stripes */
-    initial_hint = 16;
-    cache->bucket_count = 16;
+    /* Size initial hash tables with at least 256 buckets to avoid early rehashing churn */
+    initial_hint = 256;
+    cache->bucket_count = 256;
     while (cache->bucket_count < initial_hint ||
            cache->bucket_count < cache->num_stripes) {
         cache->bucket_count <<= 1;
@@ -205,6 +242,7 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
 
     cache->buckets = calloc(cache->bucket_count, sizeof(cache_bucket_t));
     if (cache->buckets == NULL) {
+        free(cache->val_locks);
         free(cache->locks);
         free(cache->name);
         free(cache);
@@ -216,80 +254,22 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
     atomic_init(&cache->current_count, 0);
     atomic_init(&cache->minimum_values_hint, 0);
     atomic_init(&cache->configured_count_hint, 0);
-    atomic_init(&cache->ref_count, 1);
+    atomic_init(&cache->user_ref_count, 1);
+    atomic_init(&cache->ref_count, 0);
+    cache->total_retained_entries = 0;
+    atomic_init(&cache->deferred_destroy, false);
     atomic_init(&cache->is_destroying, false);
 
     /* Initialize dynamic memory-proportional capacity limit */
-    {
-        uint64_t sys_mem = cache_query_physical_memory();
-        size_t dynamic_limit = (size_t)(sys_mem / CACHE_BYTES_PER_DYNAMIC_ENTRY);
-        if (dynamic_limit < CACHE_MIN_DYNAMIC_CAPACITY_LIMIT)
-            dynamic_limit = CACHE_MIN_DYNAMIC_CAPACITY_LIMIT;
-        cache->base_capacity_limit = dynamic_limit;
-        atomic_init(&cache->dynamic_capacity_limit, dynamic_limit);
-    }
+    sys_mem = cache_query_physical_memory();
+    dynamic_limit = (size_t)(sys_mem / CACHE_BYTES_PER_DYNAMIC_ENTRY);
+    if (dynamic_limit < CACHE_MIN_DYNAMIC_CAPACITY_LIMIT)
+        dynamic_limit = CACHE_MIN_DYNAMIC_CAPACITY_LIMIT;
+    cache->base_capacity_limit = dynamic_limit;
+    atomic_init(&cache->dynamic_capacity_limit, dynamic_limit);
 
-    /* Create a serial queue targeting the low-priority global queue for memory-pressure events */
-    monitor_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
-    cache->monitor_queue = dispatch_queue_create("com.darwin.libcache.monitor",
-        DISPATCH_QUEUE_SERIAL);
-    if (cache->monitor_queue != NULL) {
-        dispatch_set_target_queue(cache->monitor_queue, monitor_queue);
-
-        cache->mem_pressure_source = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
-            0,
-            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
-            cache->monitor_queue
-        );
-        cache->sim_pressure_source = dispatch_source_create(
-            DISPATCH_SOURCE_TYPE_DATA_OR,
-            0,
-            0,
-            cache->monitor_queue
-        );
-
-        if (cache->mem_pressure_source != NULL &&
-            cache->sim_pressure_source != NULL) {
-            dispatch_source_t pressure_source = cache->mem_pressure_source;
-            dispatch_source_t sim_source = cache->sim_pressure_source;
-            __block cache_t *weak_cache = cache;
-            dispatch_block_t pressure_handler = ^{
-                unsigned long raw_flags;
-                dispatch_source_memorypressure_flags_t pressure_flags;
-
-                /*
-                 * dispatch_source_cancel() is asynchronous and does not
-                 * preempt or dequeue an event handler block that has already
-                 * been scheduled onto cache->monitor_queue. Checking
-                 * is_destroying ensures that any handler block drained by
-                 * cache_destroy()'s dispatch_sync(cache->monitor_queue, ...)
-                 * exits immediately without touching cache state during
-                 * teardown.
-                 */
-                if (atomic_load_explicit(&weak_cache->is_destroying,
-                    memory_order_acquire) ||
-                    dispatch_source_testcancel(pressure_source) != 0 ||
-                    dispatch_source_testcancel(sim_source) != 0) {
-                    return;
-                }
-
-                raw_flags = dispatch_source_get_data(pressure_source) |
-                    dispatch_source_get_data(sim_source);
-                pressure_flags = (dispatch_source_memorypressure_flags_t)raw_flags;
-
-                if (pressure_flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | DISPATCH_MEMORYPRESSURE_NORMAL)) {
-                    _cache_handle_memory_pressure_event(weak_cache, pressure_flags);
-                }
-            };
-            dispatch_source_set_event_handler(pressure_source,
-                pressure_handler);
-            dispatch_source_set_event_handler(sim_source, pressure_handler);
-            dispatch_resume(pressure_source);
-            dispatch_resume(sim_source);
-            _cache_sim_pressure_enroll(cache);
-        }
-    }
+    /* Initialize memory-pressure event sources and monitor queue */
+    cache_init_memory_pressure_monitor(cache);
 
     *cache_out = cache;
     return (0);
@@ -389,7 +369,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                             cache->attrs.user_data);
                     }
                     curr->retain_count++;
-                    cache_retain(cache);
                 }
                 if (cost > curr->cost) {
                     atomic_fetch_add_explicit(&cache->current_cost,
@@ -404,7 +383,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                 entry->value = NULL;
                 free_entry_resources(cache, entry);
 
-                touch_entry(cache, curr);
+                touch(cache, curr);
                 cache_unlock_lru(cache);
                 os_unfair_lock_unlock(stripe_lock);
                 return (0);
@@ -429,9 +408,6 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
     /* Insert the new entry at the head of its key hash bucket */
     entry->next = GET_KEY_BUCKET(cache, hash_val);
     GET_KEY_BUCKET(cache, hash_val) = entry;
-    if (value_store != NULL) {
-        cache_retain(cache);
-    }
     attach_probation_head(cache, entry);
     attach_val_bucket(cache, entry);
     cache_unlock_lru(cache);
@@ -523,13 +499,13 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
     /* Search the bucket chain for a matching key */
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
-            /* If unretained, mark value non-purgeable and evict if it was purged */
-            cache_lock_lru(cache);
             if (curr->value != NULL) {
+                /* If unretained, verify and mark value non-purgeable before retain */
                 if (curr->retain_count == 0 &&
                     cache->attrs.value_make_nonpurgeable_cb != NULL) {
                     if (!cache->attrs.value_make_nonpurgeable_cb(curr->value,
                         cache->attrs.user_data)) {
+                        cache_lock_lru(cache);
                         detach_entry(cache, curr);
                         free_entry_resources(cache, curr);
                         cache_unlock_lru(cache);
@@ -538,81 +514,43 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
                     }
                 }
 
-                /* Retain the entry to prevent eviction while held by the caller */
+                /* Retain entry under stripe lock to prevent eviction while held by caller */
                 curr->retain_count++;
-                cache_retain(cache);
+                *value_out = curr->value;
+                os_unfair_lock_unlock(stripe_lock);
+
+                /* Promote or touch entry in LRU segment */
+                if (!curr->is_protected) {
+                    cache_lock_lru(cache);
+                    touch(cache, curr);
+                    cache_unlock_lru(cache);
+                } else if (cache->prot_head != curr) {
+                    if (os_unfair_lock_trylock(&cache->lru_lock)) {
+                        touch(cache, curr);
+                        cache_unlock_lru(cache);
+                    }
+                }
+
+                return (0);
+            } else {
+                if (!curr->is_protected) {
+                    cache_lock_lru(cache);
+                    touch(cache, curr);
+                    cache_unlock_lru(cache);
+                } else if (cache->prot_head != curr) {
+                    if (os_unfair_lock_trylock(&cache->lru_lock)) {
+                        touch(cache, curr);
+                        cache_unlock_lru(cache);
+                    }
+                }
+                *value_out = NULL;
+                os_unfair_lock_unlock(stripe_lock);
+                return (0);
             }
-            *value_out = curr->value;
-            
-            /* Promote the entry via SLRU rules */
-            touch_entry(cache, curr);
-            cache_unlock_lru(cache);
-            os_unfair_lock_unlock(stripe_lock);
-            return (0);
         }
         curr = curr->next;
     }
     os_unfair_lock_unlock(stripe_lock);
-    return (ENOENT);
-}
-
-/**
- * @brief Releases a previously retained reference to a cached value.
- * @details Decrements the entry's retain count. When the retain count drops
- *          to 0, value_make_purgeable_cb is invoked for active entries, or
- *          the entry is finalized and freed if it was previously removed
- *          while retained. If value is NULL, returns 0 without modifying
- *          cache state.
- * @param cache A valid cache instance.
- * @param value Value pointer previously retained via cache_set_and_retain or
- *              cache_get_and_retain, or NULL.
- * @return 0 on success (or if value is NULL), EINVAL if cache is NULL, or
- *         ENOENT if a non-NULL value is not tracked by the cache.
- */
-CACHE_PUBLIC_API int
-cache_release_value(cache_t *cache, void *value)
-{
-    cache_entry_t *curr;
-    size_t val_hash;
-
-    if (cache == NULL)
-        return (EINVAL);
-
-    if (value == NULL)
-        return (0);
-
-    /* Fast O(1) lookup via value-pointer hash index under lru_lock */
-    cache_lock_lru(cache);
-    val_hash = cache_hash_pointer(value);
-    curr = GET_VAL_BUCKET(cache, val_hash);
-    while (curr != NULL) {
-        if (curr->value == value) {
-            if (curr->retain_count > 0) {
-                curr->retain_count--;
-                if (curr->retain_count == 0) {
-                    if (curr->is_removed) {
-                        detach_val_bucket(cache, curr);
-                        free_entry_resources(cache, curr);
-                        cache_unlock_lru(cache);
-                        cache_release(cache);
-                        return (0);
-                    }
-                    if (cache->attrs.value_make_purgeable_cb != NULL) {
-                        cache->attrs.value_make_purgeable_cb(
-                            curr->value, cache->attrs.user_data);
-                    }
-                }
-                cache_unlock_lru(cache);
-                cache_release(cache);
-                return (0);
-            }
-            cache_unlock_lru(cache);
-            return (0);
-        }
-        curr = curr->val_next;
-    }
-    cache_unlock_lru(cache);
-
     return (ENOENT);
 }
 
@@ -663,8 +601,8 @@ cache_remove(cache_t *cache, void *key)
 }
 
 /**
- * @brief Evicts all live entries from the cache while all stripe locks and
- *        the LRU lock are held.
+ * @brief Evicts all live entries from the cache while all stripe locks,
+ *        the LRU lock, and all value stripe locks are held.
  * @details Unretained entries are finalized and freed, while currently
  *          retained entries remain indexed by value for deferred O(1)
  *          finalization via cache_release_value.
@@ -673,7 +611,7 @@ cache_remove(cache_t *cache, void *key)
 static void
 cache_remove_all_locked(cache_t *cache)
 {
-    cache_entry_t *curr, *next;
+    cache_entry_t *val_curr, *val_next, *val_prev;
     size_t b;
 
     /* Unlink all key bucket heads so key lookups miss immediately */
@@ -681,13 +619,7 @@ cache_remove_all_locked(cache_t *cache)
         cache->buckets[b].key_head = NULL;
     }
 
-    /* Process all active entries across protected and probationary segments */
-    cache_entry_t *seg_heads[2];
-    int s;
-
-    seg_heads[0] = cache->prot_head;
-    seg_heads[1] = cache->prob_head;
-
+    /* Clear SLRU segment queues */
     cache->prot_head = NULL;
     cache->prot_tail = NULL;
     cache->prot_count = 0;
@@ -697,46 +629,37 @@ cache_remove_all_locked(cache_t *cache)
     cache->head = NULL;
     cache->tail = NULL;
 
-    for (s = 0; s < 2; s++) {
-        curr = seg_heads[s];
-        while (curr != NULL) {
-            next = curr->lru_next;
-            curr->lru_prev = NULL;
-            curr->lru_next = NULL;
-            curr->next = NULL;
-            if (curr->retain_count > 0) {
-                curr->is_removed = true;
-            } else {
-                detach_val_bucket(cache, curr);
-                free_entry_resources(cache, curr);
-            }
-            curr = next;
-        }
-    }
-
-    /* Sweep any unretained entries from value buckets */
+    /*
+     * Every valid entry in the cache is present in val_head.
+     * Process all entries: unretained entries are finalized and freed,
+     * while retained entries remain in val_head (marked removed) for deferred release.
+     */
     for (b = 0; b < cache->bucket_count; b++) {
-        cache_entry_t *val_curr = cache->buckets[b].val_head;
-        cache_entry_t *val_prev = NULL;
+        val_curr = cache->buckets[b].val_head;
+        val_prev = NULL;
         while (val_curr != NULL) {
-            cache_entry_t *val_next = val_curr->val_next;
-            if (val_curr->retain_count == 0) {
+            val_next = val_curr->val_next;
+            val_curr->next = NULL;
+            val_curr->lru_next = NULL;
+            val_curr->lru_prev = NULL;
+
+            if (val_curr->retain_count > 0) {
+                val_curr->is_removed = true;
+                val_prev = val_curr;
+            } else {
                 if (val_prev != NULL)
                     val_prev->val_next = val_next;
                 else
                     cache->buckets[b].val_head = val_next;
                 val_curr->val_next = NULL;
                 free_entry_resources(cache, val_curr);
-            } else {
-                val_curr->is_removed = true;
-                val_prev = val_curr;
             }
             val_curr = val_next;
         }
     }
 
-    cache->current_cost = 0;
-    cache->current_count = 0;
+    atomic_store_explicit(&cache->current_cost, 0, memory_order_relaxed);
+    atomic_store_explicit(&cache->current_count, 0, memory_order_relaxed);
 }
 
 /**
@@ -756,9 +679,11 @@ cache_remove_all(cache_t *cache)
 
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
 
     cache_remove_all_locked(cache);
 
+    cache_unlock_val_stripes(cache);
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
@@ -843,14 +768,17 @@ cache_get(cache_t *cache, void *key, void **value_out)
     curr = GET_KEY_BUCKET(cache, hash_val);
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
-            
-            /* Return the value pointer without modifying the entry's retain count */
+            if (!curr->is_protected) {
+                cache_lock_lru(cache);
+                touch(cache, curr);
+                cache_unlock_lru(cache);
+            } else if (cache->prot_head != curr) {
+                if (os_unfair_lock_trylock(&cache->lru_lock)) {
+                    touch(cache, curr);
+                    cache_unlock_lru(cache);
+                }
+            }
             *value_out = curr->value;
-            
-            /* Promote the entry via SLRU rules */
-            cache_lock_lru(cache);
-            touch_entry(cache, curr);
-            cache_unlock_lru(cache);
             os_unfair_lock_unlock(stripe_lock);
             return (0);
         }
@@ -874,79 +802,181 @@ cache_retain(cache_t *cache)
     if (cache == NULL)
         return;
 
-    atomic_fetch_add_explicit(&cache->ref_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&cache->user_ref_count, 1, memory_order_relaxed);
 }
 
 /**
- * @brief Decrements the internal reference count of a cache instance and
- *        cleans up the cache when the reference count drops to zero.
- * @details Atomically decrements the cache's internal reference count. When
- *          the reference count drops to 0, cache_release cancels memory
- *          pressure monitoring, invokes cache_remove_all_locked to evict all
- *          live entries, frees associated resources, and deallocates the
- *          cache container.
- * @param cache A valid cache instance to release (ignored if NULL).
+ * @brief Performs final deallocation of a cache container and all resources.
+ * @param cache A valid cache instance.
  */
-CACHE_PRIVATE_API void
-cache_release(cache_t *cache)
+static void
+cache_deallocate_internal(cache_t *cache)
 {
-    uint32_t prev_ref;
-
-    if (cache == NULL)
-        return;
-
-    prev_ref = atomic_fetch_sub_explicit(&cache->ref_count, 1,
-        memory_order_acq_rel);
-    if (prev_ref > 1)
-        return;
-
-    /* Signal teardown, cancel sources, and drain the serial monitor queue */
-    atomic_store_explicit(&cache->is_destroying, true, memory_order_release);
-    _cache_sim_pressure_unenroll(cache);
-
-    if (cache->mem_pressure_source != NULL) {
-        dispatch_source_cancel(cache->mem_pressure_source);
-    }
-    if (cache->sim_pressure_source != NULL) {
-        dispatch_source_cancel(cache->sim_pressure_source);
-    }
-    if (cache->monitor_queue != NULL) {
-        dispatch_sync(cache->monitor_queue, ^{
-            if (cache->mem_pressure_source != NULL) {
-                dispatch_release(cache->mem_pressure_source);
-                cache->mem_pressure_source = NULL;
-            }
-            if (cache->sim_pressure_source != NULL) {
-                dispatch_release(cache->sim_pressure_source);
-                cache->sim_pressure_source = NULL;
-            }
-        });
-        dispatch_release(cache->monitor_queue);
-        cache->monitor_queue = NULL;
-    }
+    /* Tear down memory-pressure event sources and monitor queue */
+    cache_teardown_memory_pressure_monitor(cache);
 
     /* Acquire all locks and invoke cache_remove_all_locked to evict all live entries */
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
 
     cache_remove_all_locked(cache);
 
+    cache_unlock_val_stripes(cache);
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
-    /* Free internal hash table, lock array, name string, and cache container */
+    /* Free internal hash table, lock arrays, name string, and cache container */
     free(cache->buckets);
     free(cache->locks);
+    free(cache->val_locks);
     free(cache->name);
     free(cache);
 }
 
 /**
+ * @brief Releases a previously retained reference to a cached value.
+ * @details Decrements the entry's retain count. When the retain count drops
+ *          to 0, value_make_purgeable_cb is invoked for active entries, or
+ *          the entry is finalized and freed if it was previously removed
+ *          while retained. If value is NULL, returns 0 without modifying
+ *          cache state.
+ * @param cache A valid cache instance.
+ * @param value Value pointer previously retained via cache_set_and_retain or
+ *              cache_get_and_retain, or NULL.
+ * @return 0 on success (or if value is NULL), EINVAL if cache is NULL, or
+ *         ENOENT if a non-NULL value is not tracked by the cache.
+ */
+CACHE_PUBLIC_API int
+cache_release_value(cache_t *cache, void *value)
+{
+    cache_entry_t *curr, *prev;
+    size_t val_hash, slot;
+    os_unfair_lock_t val_lock;
+    bool found_entry = false;
+
+    if (cache == NULL)
+        return (EINVAL);
+
+    if (value == NULL)
+        return (0);
+
+    /* Fast O(1) lookup via value-pointer hash index under striped val_lock */
+    val_hash = cache_hash_pointer(value);
+    slot = val_hash & cache->bucket_mask;
+    val_lock = GET_VAL_STRIPE_LOCK(cache, val_hash);
+
+    os_unfair_lock_lock(val_lock);
+    curr = cache->buckets[slot].val_head;
+    prev = NULL;
+    while (curr != NULL) {
+        if (curr->value == value) {
+            found_entry = true;
+            if (curr->retain_count > 0) {
+                curr->retain_count--;
+                bool is_zero = (curr->retain_count == 0);
+                bool is_removed = curr->is_removed;
+                bool is_deferred = atomic_load_explicit(&cache->deferred_destroy,
+                    memory_order_acquire);
+
+                if (is_zero && is_removed) {
+                    if (prev != NULL)
+                        prev->val_next = curr->val_next;
+                    else
+                        cache->buckets[slot].val_head = curr->val_next;
+                    curr->val_next = NULL;
+                    os_unfair_lock_unlock(val_lock);
+
+                    free_entry_resources(cache, curr);
+
+                    if (__builtin_expect(is_deferred, 0)) {
+                        uint32_t prev_ref = atomic_fetch_sub_explicit(
+                            &cache->ref_count, 1, memory_order_acq_rel);
+                        if (prev_ref == 1)
+                            cache_deallocate_internal(cache);
+                    }
+                    return (0);
+                }
+
+                if (is_zero && cache->attrs.value_make_purgeable_cb != NULL) {
+                    cache->attrs.value_make_purgeable_cb(
+                        curr->value, cache->attrs.user_data);
+                }
+
+                os_unfair_lock_unlock(val_lock);
+
+                if (__builtin_expect(is_deferred, 0)) {
+                    uint32_t prev_ref = atomic_fetch_sub_explicit(
+                        &cache->ref_count, 1, memory_order_acq_rel);
+                    if (prev_ref == 1)
+                        cache_deallocate_internal(cache);
+                }
+                return (0);
+            }
+        }
+        prev = curr;
+        curr = curr->val_next;
+    }
+    os_unfair_lock_unlock(val_lock);
+
+    return (found_entry ? 0 : ENOENT);
+}
+
+/**
+ * @brief Decrements the internal reference count of a cache instance and
+ *        cleans up the cache when the reference count drops to zero.
+ * @param cache A valid cache instance to release (ignored if NULL).
+ */
+CACHE_PRIVATE_API void
+cache_release(cache_t *cache)
+{
+    uint32_t prev_user;
+    cache_entry_t *e;
+    size_t b;
+    size_t total_retains = 0;
+
+    if (cache == NULL)
+        return;
+
+    prev_user = atomic_fetch_sub_explicit(&cache->user_ref_count, 1,
+        memory_order_acq_rel);
+    if (prev_user > 1)
+        return;
+
+    /* User handle dropped to 0. Freeze cache and count retained holds */
+    cache_lock_stripes(cache);
+    cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
+
+    for (b = 0; b < cache->bucket_count; b++) {
+        for (e = cache->buckets[b].val_head; e != NULL; e = e->val_next) {
+            if (e->retain_count > 0) {
+                total_retains += (size_t)e->retain_count;
+            }
+        }
+    }
+
+    if (total_retains > 0) {
+        atomic_store_explicit(&cache->ref_count, (uint32_t)total_retains,
+            memory_order_release);
+        atomic_store_explicit(&cache->deferred_destroy, true,
+            memory_order_release);
+        cache_unlock_val_stripes(cache);
+        cache_unlock_lru(cache);
+        cache_unlock_stripes(cache);
+        return;
+    }
+
+    cache_unlock_val_stripes(cache);
+    cache_unlock_lru(cache);
+    cache_unlock_stripes(cache);
+
+    cache_deallocate_internal(cache);
+}
+
+/**
  * @brief Forcefully invalidates and tears down the cache instance
  *        immediately.
- * @details Clears any remaining entry retain counts and resets the internal
- *          reference count balance to 1 before calling cache_release()
- *          directly to evict all entries and deallocate the cache container.
  * @param cache A valid non-NULL cache instance to destroy.
  * @return 0 on success, or EINVAL if cache is NULL.
  */
@@ -959,10 +989,9 @@ cache_destroy(cache_t *cache)
     if (cache == NULL)
         return (EINVAL);
 
-    atomic_store_explicit(&cache->is_destroying, true, memory_order_release);
-
     cache_lock_stripes(cache);
     cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
 
     for (curr = cache->prot_head; curr != NULL; curr = curr->lru_next)
         curr->retain_count = 0;
@@ -975,12 +1004,11 @@ cache_destroy(cache_t *cache)
             curr->retain_count = 0;
     }
 
-    atomic_store_explicit(&cache->ref_count, 1, memory_order_release);
-
+    cache_unlock_val_stripes(cache);
     cache_unlock_lru(cache);
     cache_unlock_stripes(cache);
 
-    cache_release(cache);
+    cache_deallocate_internal(cache);
     return (0);
 }
 
@@ -1135,15 +1163,19 @@ cache_invoke(cache_t *cache, void *key, cache_invoke_cb_t invoke_cb,
 
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
-            
-            /* Retain the entry and promote it to the MRU head before unlocking */
-            cache_lock_lru(cache);
             if (curr->value != NULL) {
                 curr->retain_count++;
-                cache_retain(cache);
             }
-            touch_entry(cache, curr);
-            cache_unlock_lru(cache);
+            if (!curr->is_protected) {
+                cache_lock_lru(cache);
+                touch(cache, curr);
+                cache_unlock_lru(cache);
+            } else if (cache->prot_head != curr) {
+                if (os_unfair_lock_trylock(&cache->lru_lock)) {
+                    touch(cache, curr);
+                    cache_unlock_lru(cache);
+                }
+            }
             os_unfair_lock_unlock(stripe_lock);
 
             /* Invoke the callback outside the lock with the pinned entry */
