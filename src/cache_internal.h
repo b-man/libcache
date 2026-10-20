@@ -111,41 +111,40 @@ typedef struct cache_bucket_s {
 
 /* Core cache container structure. */
 struct cache_s {
-    char                    *name;                  /* Descriptive cache name string. */
-    cache_stripe_lock_t     *locks;                 /* Array of cache-line padded stripe locks for key buckets. */
-    cache_stripe_lock_t     *val_locks;             /* Array of cache-line padded stripe locks for value buckets. */
-    size_t                   num_stripes;           /* Number of stripe locks (power of two). */
-    size_t                   stripe_mask;           /* Bitwise stripe index mask (num_stripes - 1). */
-    _Alignas(CACHE_LINE_SIZE) os_unfair_lock lru_lock; /* Lock protecting SLRU queues. */
-    uint8_t                  _lru_pad[CACHE_LINE_SIZE - sizeof(os_unfair_lock)];
-    cache_attributes_t       attrs;                 /* Configured cache attributes and callbacks. */
-    _Atomic cache_cost_t     current_cost;          /* Aggregate cost of all active entries. */
-    _Atomic size_t           current_count;         /* Total number of active entries. */
-    _Atomic size_t           minimum_values_hint;   /* Configured minimum values hint. */
-    _Atomic size_t           configured_count_hint; /* Configured maximum entry count ceiling (0 = automatic). */
-    _Atomic size_t           dynamic_capacity_limit;/* Dynamic memory-proportional capacity limit. */
-    size_t                   base_capacity_limit;   /* Baseline dynamic capacity limit at normal memory. */
-    _Atomic uint32_t         user_ref_count;        /* Reference count for user descriptor handle. */
-    _Atomic uint32_t         ref_count;             /* Reference count for cache descriptor lifecycle. */
-    size_t                   total_retained_entries;/* Total active retained entries; protected by lru_lock. */
-    _Atomic bool             deferred_destroy;      /* True if cache_release was called while entries were retained. */
-    malloc_zone_t           *memory_zone;           /* Backing malloc zone for cache_entry_t allocations. */
-    dispatch_queue_t         monitor_queue;         /* Serial dispatch queue for memory-pressure events. */
-    dispatch_source_t        mem_pressure_source;   /* GCD memory-pressure event source. */
-    dispatch_source_t        sim_pressure_source;   /* GCD simulated memory-pressure event source. */
-    struct cache_s          *sim_next;              /* Next active cache in simulated pressure list. */
-    _Atomic bool             is_destroying;         /* Flag indicating teardown is in progress. */
-    cache_bucket_t          *buckets;               /* Unified key and value hash table bucket array. */
-    size_t                   bucket_count;          /* Number of hash buckets (power of two). */
-    size_t                   bucket_mask;           /* Bitwise bucket mask (bucket_count - 1). */
-    cache_entry_t           *prob_head;             /* MRU entry at head of probationary segment. */
-    cache_entry_t           *prob_tail;             /* LRU entry at tail of probationary segment. */
-    size_t                   prob_count;            /* Count of active entries in probationary segment. */
-    cache_entry_t           *prot_head;             /* MRU entry at head of protected segment. */
-    cache_entry_t           *prot_tail;             /* LRU entry at tail of protected segment. */
-    size_t                   prot_count;            /* Count of active entries in protected segment. */
-    cache_entry_t           *head;                  /* Overall MRU entry alias. */
-    cache_entry_t           *tail;                  /* Overall LRU entry alias. */
+    char                    *name;                   /* Descriptive cache name string. */
+    cache_stripe_lock_t     *locks;                  /* Array of cache-line padded stripe locks for key buckets. */
+    cache_stripe_lock_t     *val_locks;              /* Array of cache-line padded stripe locks for value buckets. */
+    size_t                   num_stripes;            /* Number of stripe locks (power of two). */
+    size_t                   stripe_mask;            /* Bitwise stripe index mask (num_stripes - 1). */
+    os_unfair_lock           lru_lock;               /* Lock protecting SLRU queues. */
+    cache_attributes_t       attrs;                  /* Configured cache attributes and callbacks. */
+    _Atomic cache_cost_t     current_cost;           /* Aggregate cost of all active entries. */
+    _Atomic size_t           current_count;          /* Total number of active entries. */
+    _Atomic size_t           minimum_values_hint;    /* Configured minimum values hint. */
+    _Atomic size_t           configured_count_hint;  /* Configured maximum entry count ceiling (0 = automatic). */
+    _Atomic size_t           dynamic_capacity_limit; /* Dynamic memory-proportional capacity limit. */
+    size_t                   base_capacity_limit;    /* Baseline dynamic capacity limit at normal memory. */
+    _Atomic uint32_t         user_ref_count;         /* Reference count for user descriptor handle. */
+    _Atomic uint32_t         ref_count;              /* Reference count for cache descriptor lifecycle. */
+    size_t                   total_retained_entries; /* Total active retained entries; protected by lru_lock. */
+    _Atomic bool             deferred_destroy;       /* True if cache_release was called while entries were retained. */
+    malloc_zone_t           *memory_zone;            /* Backing malloc zone for cache_entry_t allocations. */
+    dispatch_queue_t         monitor_queue;          /* Serial dispatch queue for memory-pressure events. */
+    dispatch_source_t        mem_pressure_source;    /* GCD memory-pressure event source. */
+    dispatch_source_t        sim_pressure_source;    /* GCD simulated memory-pressure event source. */
+    struct cache_s          *sim_next;               /* Next active cache in simulated pressure list. */
+    _Atomic bool             is_destroying;          /* Flag indicating teardown is in progress. */
+    cache_bucket_t          *buckets;                /* Unified key and value hash table bucket array. */
+    size_t                   bucket_count;           /* Number of hash buckets (power of two). */
+    size_t                   bucket_mask;            /* Bitwise bucket mask (bucket_count - 1). */
+    cache_entry_t           *prob_head;              /* MRU entry at head of probationary segment. */
+    cache_entry_t           *prob_tail;              /* LRU entry at tail of probationary segment. */
+    size_t                   prob_count;             /* Count of active entries in probationary segment. */
+    cache_entry_t           *prot_head;              /* MRU entry at head of protected segment. */
+    cache_entry_t           *prot_tail;              /* LRU entry at tail of protected segment. */
+    size_t                   prot_count;             /* Count of active entries in protected segment. */
+    cache_entry_t           *head;                   /* Overall MRU entry alias. */
+    cache_entry_t           *tail;                   /* Overall LRU entry alias. */
 };
 
 /**
@@ -234,15 +233,13 @@ size_t cache_get_effective_count_limit(const cache_t *cache);
 void detach(cache_t *cache, cache_entry_t *entry);
 void attach_probation_head(cache_t *cache, cache_entry_t *entry);
 void attach_protected_head(cache_t *cache, cache_entry_t *entry);
-void touch(cache_t *cache, cache_entry_t *entry);
+void touch_entry(cache_t *cache, cache_entry_t *entry);
 void attach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_val_bucket(cache_t *cache, cache_entry_t *entry);
 void detach_key_bucket(cache_t *cache, cache_entry_t *entry);
 void mark_entry_removed(cache_t *cache, cache_entry_t *entry);
 void free_entry_resources(cache_t *cache, cache_entry_t *entry);
 void detach_entry(cache_t *cache, cache_entry_t *entry);
-void _cache_sim_pressure_enroll(cache_t *cache);
-void _cache_sim_pressure_unenroll(cache_t *cache);
 void cache_init_memory_pressure_monitor(cache_t *cache);
 void cache_teardown_memory_pressure_monitor(cache_t *cache);
 

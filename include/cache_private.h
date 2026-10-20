@@ -11,7 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <dispatch/source.h>
 
-#include "cache.h"
+#include <cache.h>
 
 #if defined(CACHE_PRIVATE) && (defined(__GNUC__) || defined(__clang__))
     #define CACHE_PRIVATE_API __attribute__((visibility("default")))
@@ -30,14 +30,11 @@ __BEGIN_DECLS
 typedef bool (^cache_remove_block_t)(void *key, void *value);
 
 /**
- * @brief Callback invoked by cache_invoke on a cache hit or miss.
- * @param key Queried key pointer.
- * @param value_ptr In/out pointer to the entry's value pointer.
- * @param exists True if the key was found in the cache, false on a miss.
- * @param context User context pointer passed to cache_invoke.
+ * @brief Callback function executed by cache_invoke when an entry is resolved.
+ * @param value The data pointer associated with the key, safely retained for the callback duration.
+ * @param context The user-defined context passed into cache_invoke.
  */
-typedef void (*cache_invoke_cb_t)(void *key, void **value_ptr, bool exists,
-    void *context);
+typedef void (*cache_invoke_cb_t)(void *value, void *context);
 
 /**
  * @brief Aggregate cost and entry count snapshot of a cache.
@@ -190,15 +187,17 @@ CACHE_PRIVATE_API int cache_set_cost_hint(cache_t *cache, void *key,
     cache_cost_t cost);
 
 /**
- * @brief Invokes a callback for a key on a cache hit or miss.
- * @param cache Target cache instance.
- * @param key Non-NULL key to query.
- * @param invoke_cb Callback invoked with the existing or new value pointer.
- * @param context User context pointer forwarded to invoke_cb.
- * @return 0 on hit or new insertion, EINVAL on invalid args, or ENOENT.
+ * @brief Safely accesses and performs actions on a cached value within a protected scope.
+ * @details Executes a user-provided callback function inside a protected scope where
+ *          the value is guaranteed to remain valid and retained.
+ * @param cache The target cache instance containing the data.
+ * @param key A pointer to the unique identifier for the desired cache entry.
+ * @param callback A function pointer executed when the entry is resolved.
+ * @param context A pass-through pointer forwarded directly to callback.
+ * @return 0 on success, or non-zero error code.
  */
 CACHE_PRIVATE_API int cache_invoke(cache_t *cache, void *key,
-    cache_invoke_cb_t invoke_cb, void *context);
+    cache_invoke_cb_t callback, void *context);
 
 /**
  * @brief Broadcasts a simulated low-memory warning event via GCD.

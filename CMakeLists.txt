@@ -25,6 +25,7 @@ add_library(cache SHARED
     src/cache_callbacks.c 
     src/cache_common.c 
     src/cache_diagnostics.c 
+    src/cache_entry.c
     src/cache_eviction.c
     src/cache_queue.c
 )

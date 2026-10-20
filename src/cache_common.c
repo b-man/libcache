@@ -383,7 +383,7 @@ cache_set_and_retain(cache_t *cache, void *key, void *value, cache_cost_t cost)
                 entry->value = NULL;
                 free_entry_resources(cache, entry);
 
-                touch(cache, curr);
+                touch_entry(cache, curr);
                 cache_unlock_lru(cache);
                 os_unfair_lock_unlock(stripe_lock);
                 return (0);
@@ -522,11 +522,11 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
                 /* Promote or touch entry in LRU segment */
                 if (!curr->is_protected) {
                     cache_lock_lru(cache);
-                    touch(cache, curr);
+                    touch_entry(cache, curr);
                     cache_unlock_lru(cache);
                 } else if (cache->prot_head != curr) {
                     if (os_unfair_lock_trylock(&cache->lru_lock)) {
-                        touch(cache, curr);
+                        touch_entry(cache, curr);
                         cache_unlock_lru(cache);
                     }
                 }
@@ -535,11 +535,11 @@ cache_get_and_retain(cache_t *cache, void *key, void **value_out)
             } else {
                 if (!curr->is_protected) {
                     cache_lock_lru(cache);
-                    touch(cache, curr);
+                    touch_entry(cache, curr);
                     cache_unlock_lru(cache);
                 } else if (cache->prot_head != curr) {
                     if (os_unfair_lock_trylock(&cache->lru_lock)) {
-                        touch(cache, curr);
+                        touch_entry(cache, curr);
                         cache_unlock_lru(cache);
                     }
                 }
@@ -601,18 +601,26 @@ cache_remove(cache_t *cache, void *key)
 }
 
 /**
- * @brief Evicts all live entries from the cache while all stripe locks,
- *        the LRU lock, and all value stripe locks are held.
- * @details Unretained entries are finalized and freed, while currently
- *          retained entries remain indexed by value for deferred O(1)
- *          finalization via cache_release_value.
- * @param cache A valid locked cache instance.
+ * @brief Removes all entries from the cache and resets aggregate cost and
+ *        count metrics to zero.
+ * @details Unretained entries are finalized and freed immediately, while
+ *          currently retained entries are unlinked and deferred until
+ *          released via cache_release_value.
+ * @param cache A valid cache instance.
+ * @return 0 on success, or EINVAL if cache is NULL.
  */
-static void
-cache_remove_all_locked(cache_t *cache)
+CACHE_PUBLIC_API int
+cache_remove_all(cache_t *cache)
 {
     cache_entry_t *val_curr, *val_next, *val_prev;
     size_t b;
+
+    if (cache == NULL)
+        return (EINVAL);
+
+    cache_lock_stripes(cache);
+    cache_lock_lru(cache);
+    cache_lock_val_stripes(cache);
 
     /* Unlink all key bucket heads so key lookups miss immediately */
     for (b = 0; b < cache->bucket_count; b++) {
@@ -660,28 +668,6 @@ cache_remove_all_locked(cache_t *cache)
 
     atomic_store_explicit(&cache->current_cost, 0, memory_order_relaxed);
     atomic_store_explicit(&cache->current_count, 0, memory_order_relaxed);
-}
-
-/**
- * @brief Removes all entries from the cache and resets aggregate cost and
- *        count metrics to zero.
- * @details Unretained entries are finalized and freed immediately, while
- *          currently retained entries are unlinked and deferred until
- *          released via cache_release_value.
- * @param cache A valid cache instance.
- * @return 0 on success, or EINVAL if cache is NULL.
- */
-CACHE_PUBLIC_API int
-cache_remove_all(cache_t *cache)
-{
-    if (cache == NULL)
-        return (EINVAL);
-
-    cache_lock_stripes(cache);
-    cache_lock_lru(cache);
-    cache_lock_val_stripes(cache);
-
-    cache_remove_all_locked(cache);
 
     cache_unlock_val_stripes(cache);
     cache_unlock_lru(cache);
@@ -770,11 +756,11 @@ cache_get(cache_t *cache, void *key, void **value_out)
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             if (!curr->is_protected) {
                 cache_lock_lru(cache);
-                touch(cache, curr);
+                touch_entry(cache, curr);
                 cache_unlock_lru(cache);
             } else if (cache->prot_head != curr) {
                 if (os_unfair_lock_trylock(&cache->lru_lock)) {
-                    touch(cache, curr);
+                    touch_entry(cache, curr);
                     cache_unlock_lru(cache);
                 }
             }
@@ -815,16 +801,8 @@ cache_deallocate_internal(cache_t *cache)
     /* Tear down memory-pressure event sources and monitor queue */
     cache_teardown_memory_pressure_monitor(cache);
 
-    /* Acquire all locks and invoke cache_remove_all_locked to evict all live entries */
-    cache_lock_stripes(cache);
-    cache_lock_lru(cache);
-    cache_lock_val_stripes(cache);
-
-    cache_remove_all_locked(cache);
-
-    cache_unlock_val_stripes(cache);
-    cache_unlock_lru(cache);
-    cache_unlock_stripes(cache);
+    /* Evict all live entries */
+    (void)cache_remove_all(cache);
 
     /* Free internal hash table, lock arrays, name string, and cache container */
     free(cache->buckets);
@@ -1127,32 +1105,26 @@ cache_set_name(cache_t *cache, const char *name)
 }
 
 /**
- * @brief Invokes a callback for a key, retaining an existing entry during
- *        execution or inserting a newly created value on a miss.
- * @details On a cache hit, the entry is retained and promoted to the LRU
- *          head, invoke_cb is called outside the lock with exists=true, and
- *          the retain hold is then released. On a cache miss, invoke_cb is
- *          called with exists=false; if it outputs a non-NULL value, the
- *          value is inserted into the cache with cost 0 and unretained.
- * @param cache A valid cache instance.
- * @param key Non-NULL key identifier to query.
- * @param invoke_cb Callback function invoked outside the cache lock on hit
- *                  or miss.
- * @param context User-defined context pointer forwarded to invoke_cb.
- * @return 0 on a cache hit or when a new non-NULL value is produced and
- *         inserted, EINVAL if cache, key, or invoke_cb is NULL, or ENOENT if
- *         the key is missing and invoke_cb does not supply a value.
+ * @brief Safely accesses and performs actions on a cached value within a protected scope.
+ * @details Instead of returning the value directly to the caller, it executes a user-provided
+ *          callback function inside a protected scope where the value is guaranteed to remain
+ *          valid and retained for the duration of the callback.
+ * @param cache The target cache instance containing the data.
+ * @param key A pointer to the unique identifier for the desired cache entry.
+ * @param callback A function pointer executed by the cache when the entry is resolved.
+ * @param context A pass-through pointer forwarded directly to callback.
+ * @return 0 on success, or non-zero error code (EINVAL, ENOENT).
  */
 CACHE_PRIVATE_API int
-cache_invoke(cache_t *cache, void *key, cache_invoke_cb_t invoke_cb,
+cache_invoke(cache_t *cache, void *key, cache_invoke_cb_t callback,
     void *context)
 {
     cache_entry_t *curr;
     os_unfair_lock_t stripe_lock;
-    void *allocated_value;
     uintptr_t hash_val;
+    void *val;
 
-    if (cache == NULL || key == NULL || invoke_cb == NULL)
+    if (cache == NULL || key == NULL || callback == NULL)
         return (EINVAL);
 
     hash_val = CACHE_KEY_HASH(cache, key);
@@ -1164,42 +1136,52 @@ cache_invoke(cache_t *cache, void *key, cache_invoke_cb_t invoke_cb,
     while (curr != NULL) {
         if (CACHE_KEY_MATCH(cache, curr, key, hash_val)) {
             if (curr->value != NULL) {
+                /* If unretained, verify and mark value non-purgeable before retain */
+                if (curr->retain_count == 0 &&
+                    cache->attrs.value_make_nonpurgeable_cb != NULL) {
+                    if (!cache->attrs.value_make_nonpurgeable_cb(curr->value,
+                        cache->attrs.user_data)) {
+                        cache_lock_lru(cache);
+                        detach_entry(cache, curr);
+                        free_entry_resources(cache, curr);
+                        cache_unlock_lru(cache);
+                        os_unfair_lock_unlock(stripe_lock);
+                        return (ENOENT);
+                    }
+                }
                 curr->retain_count++;
             }
+
+            val = curr->value;
+
+            /* Touch or promote entry in LRU segment */
             if (!curr->is_protected) {
                 cache_lock_lru(cache);
-                touch(cache, curr);
+                touch_entry(cache, curr);
                 cache_unlock_lru(cache);
             } else if (cache->prot_head != curr) {
                 if (os_unfair_lock_trylock(&cache->lru_lock)) {
-                    touch(cache, curr);
+                    touch_entry(cache, curr);
                     cache_unlock_lru(cache);
                 }
             }
+
             os_unfair_lock_unlock(stripe_lock);
 
-            /* Invoke the callback outside the lock with the pinned entry */
-            invoke_cb(curr->key, &curr->value, true, context);
+            /* Execute callback within protected scope with value safely retained */
+            callback(val, context);
 
             /* Release the temporary retain hold acquired for the callback */
-            (void)cache_release_value(cache, curr->value);
+            if (val != NULL)
+                (void)cache_release_value(cache, val);
+
             return (0);
         }
         curr = curr->next;
     }
 
     os_unfair_lock_unlock(stripe_lock);
-    allocated_value = NULL;
-    
-    /* Invoke the callback on cache miss to optionally materialize a new value */
-    invoke_cb(key, &allocated_value, false, context);
 
-    if (allocated_value != NULL) {
-        /* Insert materialized value with cost 0 and release initial retain hold */
-        if (cache_set_and_retain(cache, key, allocated_value, 0) == 0)
-            cache_release_value(cache, allocated_value);
-        return (0);
-    }
-
+    /* Key missing: exit with error code */
     return (ENOENT);
 }

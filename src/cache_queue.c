@@ -112,60 +112,6 @@ attach_protected_head(cache_t *cache, cache_entry_t *entry)
     cache->tail = cache->prob_tail ? cache->prob_tail : cache->prot_tail;
 }
 
-
-/**
- * @brief Promotes an accessed entry according to Segmented LRU (SLRU) rules.
- * @details If the entry is currently in the probationary segment, it is promoted
- *          to the protected segment MRU head. If it is already in the protected
- *          segment, it is moved to the MRU head of the protected segment. If
- *          the protected segment exceeds its capacity ceiling, its LRU tail entry
- *          is demoted back to the MRU head of the probationary segment.
- *          Caller must hold cache->lru_lock.
- * @param cache A valid cache instance.
- * @param entry Entry node that was accessed on a cache hit.
- */
-void
-touch(cache_t *cache, cache_entry_t *entry)
-{
-    size_t count_limit, prot_limit;
-    cache_entry_t *demote_node;
-
-    if (cache == NULL || entry == NULL || entry->is_removed)
-        return;
-
-    if (entry->is_protected) {
-        /* Fast path: entry is already at the protected MRU head */
-        if (cache->prot_head == entry)
-            return;
-
-        /* Already protected: move to MRU head without changing prot_count */
-        detach(cache, entry);
-        attach_protected_head(cache, entry);
-        return;
-    }
-
-    /* In probationary segment: promote to protected segment */
-    detach(cache, entry);
-    attach_protected_head(cache, entry);
-
-    /* Enforce protected segment capacity only upon probationary promotion */
-    count_limit = cache_get_effective_count_limit(cache);
-    if (count_limit > 0) {
-        prot_limit = (count_limit * 4) / 5;
-        if (prot_limit == 0)
-            prot_limit = 1;
-        else if (prot_limit >= count_limit)
-            prot_limit = count_limit - 1;
-
-        /* Demote excess entries from protected tail to probationary head */
-        while (cache->prot_count > prot_limit && cache->prot_tail != NULL) {
-            demote_node = cache->prot_tail;
-            detach(cache, demote_node);
-            attach_probation_head(cache, demote_node);
-        }
-    }
-}
-
 /**
  * @brief Unlinks an entry from its key hash bucket collision chain.
  * @details Caller must hold the stripe lock protecting entry->key_hash.

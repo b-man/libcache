@@ -20,36 +20,27 @@
 
 typedef struct {
     int invoke_calls;
-    bool last_exists;
-    void *last_key;
     void *last_value;
-    const char *materialize_str;
     cache_t *active_cache;
+    const char *key_to_check;
     int retain_count_during_hit;
 } invoke_test_ctx_t;
 
 static void
-test_invoke_callback(void *key, void **value_ptr, bool exists, void *context)
+test_invoke_callback(void *value, void *context)
 {
     invoke_test_ctx_t *ctx = (invoke_test_ctx_t *)context;
     if (ctx == NULL)
         return;
 
     ctx->invoke_calls++;
-    ctx->last_exists = exists;
-    ctx->last_key = key;
+    ctx->last_value = value;
 
-    if (exists) {
-        ctx->last_value = (value_ptr != NULL) ? *value_ptr : NULL;
-        if (ctx->active_cache != NULL) {
-            cache_entry_info_t entry_info;
-            if (cache_get_info_for_key(ctx->active_cache, key, &entry_info) == 0) {
-                ctx->retain_count_during_hit = entry_info.retain_count;
-            }
+    if (ctx->active_cache != NULL && ctx->key_to_check != NULL) {
+        cache_entry_info_t entry_info;
+        if (cache_get_info_for_key(ctx->active_cache, (void *)ctx->key_to_check, &entry_info) == 0) {
+            ctx->retain_count_during_hit = entry_info.retain_count;
         }
-    } else if (value_ptr != NULL && ctx->materialize_str != NULL) {
-        *value_ptr = strdup(ctx->materialize_str);
-        ctx->last_value = *value_ptr;
     }
 }
 
@@ -365,11 +356,12 @@ test_cache_private_get_and_invoke(void)
     /* Positive Path: cache_invoke on existing key pins entry during callback */
     memset(&ctx, 0, sizeof(ctx));
     ctx.active_cache = cache;
+    ctx.key_to_check = "peek_key";
     status = cache_invoke(cache, "peek_key", test_invoke_callback, &ctx);
     ASSERT_TRUE(status == 0,
         "cache_invoke on existing key must return 0");
-    ASSERT_TRUE(ctx.invoke_calls == 1 && ctx.last_exists == true,
-        "cache_invoke on existing key must invoke callback with exists=true");
+    ASSERT_TRUE(ctx.invoke_calls == 1,
+        "cache_invoke on existing key must execute callback once");
     ASSERT_TRUE(ctx.last_value == stored_val,
         "cache_invoke on hit must pass pointer to existing value");
     ASSERT_TRUE(ctx.retain_count_during_hit == 1,
@@ -378,29 +370,13 @@ test_cache_private_get_and_invoke(void)
         entry_info.retain_count == 0,
         "cache_invoke must release its temporary retain reference after callback returns");
 
-    /* Positive Path: cache_invoke on missing key materializes and inserts new value */
+    /* Negative Path: cache_invoke on missing key returns ENOENT and skips callback */
     memset(&ctx, 0, sizeof(ctx));
-    ctx.materialize_str = "materialized_on_miss";
-    status = cache_invoke(cache, "lazy_key", test_invoke_callback, &ctx);
-    ASSERT_TRUE(status == 0,
-        "cache_invoke must return 0 when callback materializes a non-NULL value on miss");
-    ASSERT_TRUE(ctx.invoke_calls == 1 && ctx.last_exists == false,
-        "cache_invoke on missing key must invoke callback with exists=false");
-
-    value_out = NULL;
-    ASSERT_TRUE(cache_get(cache, "lazy_key", &value_out) == 0 &&
-        value_out == ctx.last_value,
-        "Value materialized during cache_invoke miss must be stored in cache");
-    ASSERT_TRUE(cache_get_info_for_key(cache, "lazy_key", &entry_info) == 0 &&
-        entry_info.retain_count == 0,
-        "Materialized entry inserted by cache_invoke must have retain_count 0 after completion");
-
-    /* Negative Path: cache_invoke on missing key when callback leaves *value_ptr NULL */
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.materialize_str = NULL;
-    status = cache_invoke(cache, "unmaterialized_key", test_invoke_callback, &ctx);
+    status = cache_invoke(cache, "missing_key", test_invoke_callback, &ctx);
     ASSERT_TRUE(status == ENOENT,
-        "cache_invoke must return ENOENT when key is missing and callback leaves value NULL");
+        "cache_invoke on missing key must return ENOENT");
+    ASSERT_TRUE(ctx.invoke_calls == 0,
+        "cache_invoke on missing key must not run callback");
 
     ASSERT_TRUE(cache_destroy(cache) == 0,
         "cache_destroy must succeed");

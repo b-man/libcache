@@ -12,15 +12,15 @@
 #include <stddef.h>
 #include <sys/cdefs.h>
 
-/* Attribute structure version constants. */
-#define CACHE_ATTRIBUTES_VERSION_1 1
-#define CACHE_ATTRIBUTES_VERSION_2 2
-
 #if defined(__GNUC__) || defined(__clang__)
     #define CACHE_PUBLIC_API __attribute__((visibility("default")))
 #else
     #define CACHE_PUBLIC_API
 #endif
+
+/* Attribute structure version constants. */
+#define CACHE_ATTRIBUTES_VERSION_1 1
+#define CACHE_ATTRIBUTES_VERSION_2 2
 
 __BEGIN_DECLS
 
