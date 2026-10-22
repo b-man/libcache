@@ -13,7 +13,6 @@
 #include "cache.h"
 #include "cache_internal.h"
 
-
 /**
  * @brief Handles system memory-pressure events by evicting unretained
  *        entries and marking retained values purgeable under critical
@@ -154,10 +153,59 @@ _cache_sim_pressure_unenroll(cache_t *cache)
 }
 
 /**
+ * @brief GCD event callback for kernel memory-pressure notifications.
+ * @details Reads memory-pressure flags from the kernel dispatch source and
+ *          triggers cache eviction and capacity scaling when active.
+ * @param context Opaque pointer to the target cache instance.
+ */
+static void
+_cache_mem_pressure_handler(void *context)
+{
+    cache_t *cache = (cache_t *)context;
+    unsigned long raw_flags;
+    dispatch_source_memorypressure_flags_t flags;
+
+    if (cache == NULL || atomic_load_explicit(&cache->is_destroying, memory_order_acquire))
+        return;
+
+    raw_flags = dispatch_source_get_data(cache->mem_pressure_source);
+    flags = (dispatch_source_memorypressure_flags_t)raw_flags;
+
+    if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | DISPATCH_MEMORYPRESSURE_NORMAL)) {
+        _cache_handle_memory_pressure_event(cache, flags);
+    }
+}
+
+/**
+ * @brief GCD event callback for simulated memory-pressure notifications.
+ * @details Reads merged synthetic pressure flags from the data-or dispatch
+ *          source and triggers cache eviction when active.
+ * @param context Opaque pointer to the target cache instance.
+ */
+static void
+_cache_sim_pressure_handler(void *context)
+{
+    cache_t *cache = (cache_t *)context;
+    unsigned long raw_flags;
+    dispatch_source_memorypressure_flags_t flags;
+
+    if (cache == NULL || atomic_load_explicit(&cache->is_destroying, memory_order_acquire))
+        return;
+
+    raw_flags = dispatch_source_get_data(cache->sim_pressure_source);
+    flags = (dispatch_source_memorypressure_flags_t)raw_flags;
+
+    if (flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | DISPATCH_MEMORYPRESSURE_NORMAL)) {
+        _cache_handle_memory_pressure_event(cache, flags);
+    }
+}
+
+/**
  * @brief Initializes and activates memory pressure event sources and monitoring queue.
  * @details Creates a serial monitor queue targeting the low-priority global queue,
- *          configures GCD memory-pressure and simulated event sources, and enrolls
- *          the cache for pressure notifications.
+ *          configures GCD memory-pressure and simulated event sources using pure C
+ *          function callbacks to avoid block-retain cycles, and enrolls the cache
+ *          for pressure notifications.
  * @param cache A valid cache instance pointer.
  */
 void
@@ -170,7 +218,7 @@ cache_init_memory_pressure_monitor(cache_t *cache)
 
     /* Create a serial queue targeting the low-priority global queue for memory-pressure events */
     monitor_queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0);
-    cache->monitor_queue = dispatch_queue_create("com.darwin.libcache.monitor",
+    cache->monitor_queue = dispatch_queue_create(CACHE_MONITOR_QUEUE_LABEL,
         DISPATCH_QUEUE_SERIAL);
     if (cache->monitor_queue != NULL) {
         dispatch_set_target_queue(cache->monitor_queue, monitor_queue);
@@ -188,47 +236,33 @@ cache_init_memory_pressure_monitor(cache_t *cache)
             cache->monitor_queue
         );
 
-        if (cache->mem_pressure_source != NULL &&
-            cache->sim_pressure_source != NULL) {
-            dispatch_source_t pressure_source = cache->mem_pressure_source;
-            dispatch_source_t sim_source = cache->sim_pressure_source;
-            __block cache_t *weak_cache = cache;
-            dispatch_block_t pressure_handler = ^{
-                unsigned long raw_flags;
-                dispatch_source_memorypressure_flags_t pressure_flags;
-
-                /*
-                 * dispatch_source_cancel() is asynchronous and does not
-                 * preempt or dequeue an event handler block that has already
-                 * been scheduled onto cache->monitor_queue. Checking
-                 * is_destroying ensures that any handler block drained by
-                 * cache_destroy()'s dispatch_sync(cache->monitor_queue, ...)
-                 * exits immediately without touching cache state during
-                 * teardown.
-                 */
-                if (atomic_load_explicit(&weak_cache->is_destroying,
-                    memory_order_acquire) ||
-                    dispatch_source_testcancel(pressure_source) != 0 ||
-                    dispatch_source_testcancel(sim_source) != 0) {
-                    return;
-                }
-
-                raw_flags = dispatch_source_get_data(pressure_source) |
-                    dispatch_source_get_data(sim_source);
-                pressure_flags = (dispatch_source_memorypressure_flags_t)raw_flags;
-
-                if (pressure_flags & (DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | DISPATCH_MEMORYPRESSURE_NORMAL)) {
-                    _cache_handle_memory_pressure_event(weak_cache, pressure_flags);
-                }
-            };
-            dispatch_source_set_event_handler(pressure_source,
-                pressure_handler);
-            dispatch_source_set_event_handler(sim_source, pressure_handler);
-            dispatch_resume(pressure_source);
-            dispatch_resume(sim_source);
-            _cache_sim_pressure_enroll(cache);
+        if (cache->mem_pressure_source != NULL) {
+            dispatch_set_context(cache->mem_pressure_source, cache);
+            dispatch_source_set_event_handler_f(cache->mem_pressure_source,
+                _cache_mem_pressure_handler);
+            dispatch_resume(cache->mem_pressure_source);
         }
+        if (cache->sim_pressure_source != NULL) {
+            dispatch_set_context(cache->sim_pressure_source, cache);
+            dispatch_source_set_event_handler_f(cache->sim_pressure_source,
+                _cache_sim_pressure_handler);
+            dispatch_resume(cache->sim_pressure_source);
+        }
+        _cache_sim_pressure_enroll(cache);
     }
+}
+
+/**
+ * @brief No-op callback executed synchronously to drain the monitor queue.
+ * @details Used with dispatch_sync_f during cache teardown to act as a barrier,
+ *          ensuring any in-flight memory-pressure event handlers on the serial
+ *          monitor queue complete execution before the queue is released.
+ * @param context Unused callback context pointer.
+ */
+static void
+_cache_noop_drain_cb(void *context)
+{
+    (void)context;
 }
 
 /**
@@ -242,27 +276,27 @@ cache_teardown_memory_pressure_monitor(cache_t *cache)
     if (cache == NULL)
         return;
 
-    /* Signal teardown, cancel sources, and drain the serial monitor queue */
+    /* Signal teardown and unenroll from simulation registry */
     atomic_store_explicit(&cache->is_destroying, true, memory_order_release);
     _cache_sim_pressure_unenroll(cache);
 
+    /* Cancel and release memory-pressure event source */
     if (cache->mem_pressure_source != NULL) {
         dispatch_source_cancel(cache->mem_pressure_source);
+        dispatch_release(cache->mem_pressure_source);
+        cache->mem_pressure_source = NULL;
     }
+
+    /* Cancel and release simulated pressure event source */
     if (cache->sim_pressure_source != NULL) {
         dispatch_source_cancel(cache->sim_pressure_source);
+        dispatch_release(cache->sim_pressure_source);
+        cache->sim_pressure_source = NULL;
     }
+
+    /* Synchronously drain in-flight event handlers on monitor queue before releasing */
     if (cache->monitor_queue != NULL) {
-        dispatch_sync(cache->monitor_queue, ^{
-            if (cache->mem_pressure_source != NULL) {
-                dispatch_release(cache->mem_pressure_source);
-                cache->mem_pressure_source = NULL;
-            }
-            if (cache->sim_pressure_source != NULL) {
-                dispatch_release(cache->sim_pressure_source);
-                cache->sim_pressure_source = NULL;
-            }
-        });
+        dispatch_sync_f(cache->monitor_queue, NULL, _cache_noop_drain_cb);
         dispatch_release(cache->monitor_queue);
         cache->monitor_queue = NULL;
     }

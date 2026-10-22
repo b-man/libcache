@@ -77,15 +77,6 @@ CACHE_PRIVATE_API int cache_get_cost_hint(cache_t *cache, void *key,
 CACHE_PRIVATE_API int cache_get_count_hint(cache_t *cache, size_t *count_out);
 
 /**
- * @brief Retrieves the dynamic memory-proportional capacity limit.
- * @param cache Target cache instance.
- * @param limit_out Output pointer receiving the dynamic capacity limit.
- * @return 0 on success, or EINVAL on invalid arguments.
- */
-CACHE_PRIVATE_API int cache_get_dynamic_capacity_limit(cache_t *cache,
-    size_t *limit_out);
-
-/**
  * @brief Retrieves the configured minimum values hint.
  * @param cache Target cache instance.
  * @param hint_out Output pointer receiving the minimum values hint.

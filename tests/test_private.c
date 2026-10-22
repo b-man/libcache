@@ -1461,20 +1461,23 @@ test_cache_segmented_lru_demotion_and_eviction(void)
     ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
 }
 
-/*
- * Validates dynamic memory-proportional capacity limit initialization,
+/**
+ * Validates dynamic memory-proportional capacity limit behavior:
  * automatic size control without manual caller hints, caller hint override,
- * and capacity shrinkage under memory pressure with growth upon normalization.
+ * reset back to automatic dynamic management, and entry eviction under memory pressure.
  */
 void
 test_cache_dynamic_memory_proportional_capacity(void)
 {
     cache_t *cache = NULL;
     cache_attributes_t attrs;
+    cache_info_t info;
     size_t count_hint = 0;
-    size_t dyn_limit = 0;
-    size_t dyn_limit_warn = 0;
-    size_t dyn_limit_norm = 0;
+    void *val_out = NULL;
+    char *v1 = NULL;
+    char *v2 = NULL;
+    char *v_pinned = NULL;
+    char *v3 = NULL;
     int status;
     int i;
 
@@ -1492,16 +1495,6 @@ test_cache_dynamic_memory_proportional_capacity(void)
     ASSERT_TRUE(cache_get_count_hint(cache, &count_hint) == 0 && count_hint == 0,
         "Initial manual count_hint must be 0 without caller setting hints");
 
-    /* Framework automatically initializes dynamic memory-proportional limit */
-    ASSERT_TRUE(cache_get_dynamic_capacity_limit(cache, &dyn_limit) == 0 && dyn_limit >= 1024,
-        "Dynamic capacity limit must be automatically initialized and proportional to system memory");
-
-    /* Validate error handling for invalid arguments */
-    ASSERT_TRUE(cache_get_dynamic_capacity_limit(NULL, &dyn_limit) == EINVAL,
-        "cache_get_dynamic_capacity_limit with NULL cache must return EINVAL");
-    ASSERT_TRUE(cache_get_dynamic_capacity_limit(cache, NULL) == EINVAL,
-        "cache_get_dynamic_capacity_limit with NULL limit_out must return EINVAL");
-
     /* Verify caller can override automatic capacity by setting manual hint */
     ASSERT_TRUE(cache_set_count_hint(cache, 100) == 0,
         "Setting manual count_hint must succeed");
@@ -1514,31 +1507,59 @@ test_cache_dynamic_memory_proportional_capacity(void)
     ASSERT_TRUE(cache_get_count_hint(cache, &count_hint) == 0 && count_hint == 0,
         "cache_get_count_hint must return 0 after reset");
 
-    /* Simulate warning memory pressure: dynamic capacity limit must shrink */
+    /* Populate cache with multiple entries under dynamic automatic control */
+    v1 = strdup("dynamic_val_1");
+    v2 = strdup("dynamic_val_2");
+    v_pinned = strdup("dynamic_val_pinned");
+    ASSERT_TRUE(v1 != NULL && v2 != NULL && v_pinned != NULL,
+        "Allocating test values must succeed");
+
+    /* Insert 2 unretained entries and 1 retained (pinned) entry */
+    ASSERT_TRUE(cache_set_and_retain(cache, "k1", v1, 10) == 0 &&
+        cache_release_value(cache, v1) == 0,
+        "Inserting unretained k1 must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "k2", v2, 20) == 0 &&
+        cache_release_value(cache, v2) == 0,
+        "Inserting unretained k2 must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "k_pinned", v_pinned, 30) == 0,
+        "Inserting retained k_pinned must succeed");
+
+    ASSERT_TRUE(cache_get_info(cache, &info) == 0 && info.current_count == 3,
+        "Cache must hold 3 entries before memory pressure");
+
+    /* Simulate warning memory pressure: dynamic management purges unretained entries */
     ASSERT_TRUE(cache_simulate_memory_warning_event(DISPATCH_MEMORYPRESSURE_WARN) == 0,
         "Simulating WARN memory pressure must succeed");
     for (i = 0; i < 100; i++) {
-        if (cache_get_dynamic_capacity_limit(cache, &dyn_limit_warn) == 0 &&
-            dyn_limit_warn < dyn_limit) {
+        if (cache_get_info(cache, &info) == 0 && info.current_count == 1) {
             break;
         }
         usleep(1000);
     }
-    ASSERT_TRUE(dyn_limit_warn < dyn_limit,
-        "Dynamic capacity limit must shrink under memory pressure");
+    ASSERT_TRUE(cache_get_info(cache, &info) == 0 && info.current_count == 1,
+        "Memory pressure must purge unretained entries down to retained count");
+    ASSERT_TRUE(cache_get(cache, "k1", &val_out) == ENOENT,
+        "Unretained k1 must be evicted under memory pressure");
+    ASSERT_TRUE(cache_get(cache, "k2", &val_out) == ENOENT,
+        "Unretained k2 must be evicted under memory pressure");
+    ASSERT_TRUE(cache_get(cache, "k_pinned", &val_out) == 0 && val_out == v_pinned,
+        "Retained k_pinned must be preserved under memory pressure");
 
-    /* Simulate memory normalization: dynamic capacity limit must grow back */
+    /* Release pinned value */
+    ASSERT_TRUE(cache_release_value(cache, v_pinned) == 0,
+        "Releasing retained k_pinned must succeed");
+
+    /* Simulate memory normalization: cache accepts and retains new entries */
     ASSERT_TRUE(cache_simulate_memory_warning_event(DISPATCH_MEMORYPRESSURE_NORMAL) == 0,
         "Simulating NORMAL memory pressure must succeed");
-    for (i = 0; i < 100; i++) {
-        if (cache_get_dynamic_capacity_limit(cache, &dyn_limit_norm) == 0 &&
-            dyn_limit_norm == dyn_limit) {
-            break;
-        }
-        usleep(1000);
-    }
-    ASSERT_TRUE(dyn_limit_norm == dyn_limit,
-        "Dynamic capacity limit must grow back when system memory normalizes");
+
+    v3 = strdup("dynamic_val_3");
+    ASSERT_TRUE(v3 != NULL, "Allocating v3 test value must succeed");
+    ASSERT_TRUE(cache_set_and_retain(cache, "k3", v3, 15) == 0 &&
+        cache_release_value(cache, v3) == 0,
+        "Inserting unretained k3 after normalization must succeed");
+    ASSERT_TRUE(cache_get(cache, "k3", &val_out) == 0 && val_out == v3,
+        "Lookup for newly added entry k3 after normalization must succeed");
 
     ASSERT_TRUE(cache_destroy(cache) == 0, "cache_destroy must succeed");
 }

@@ -16,6 +16,13 @@
 #include "cache_private.h"
 #include "cache_callbacks.h"
 
+/* Dispatch queue label for memory pressure monitoring (debug builds only). */
+#if DEBUG
+#define CACHE_MONITOR_QUEUE_LABEL "com.darwin.libcache.monitor"
+#else
+#define CACHE_MONITOR_QUEUE_LABEL NULL
+#endif
+
 /* Maximum number of hash table buckets permitted during rehash expansion. */
 #define CACHE_MAX_BUCKET_COUNT 65536
 

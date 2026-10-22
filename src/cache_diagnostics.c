@@ -72,23 +72,6 @@ cache_get_count_hint(cache_t *cache, size_t *count_out)
 }
 
 /**
- * @brief Retrieves the dynamic memory-proportional capacity limit for the cache.
- * @param cache A valid cache instance.
- * @param limit_out Output pointer where the dynamic capacity limit is written.
- * @return 0 on success, or EINVAL if cache or limit_out is NULL.
- */
-CACHE_PRIVATE_API int
-cache_get_dynamic_capacity_limit(cache_t *cache, size_t *limit_out)
-{
-    if (cache == NULL || limit_out == NULL)
-        return (EINVAL);
-
-    *limit_out = atomic_load_explicit(&cache->dynamic_capacity_limit,
-        memory_order_relaxed);
-    return (0);
-}
-
-/**
  * @brief Retrieves the configured minimum values hint for the cache.
  * @param cache A valid cache instance.
  * @param hint_out Output pointer where the minimum values hint is written.

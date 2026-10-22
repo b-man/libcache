@@ -228,8 +228,8 @@ cache_create(const char *name, cache_attributes_t *attrs, cache_t **cache_out)
         cache->attrs.value_retain_cb = attrs->value_retain_cb;
     }
 
-    /* Bind cache entry allocations to the default purgeable malloc zone */
-    cache->memory_zone = malloc_default_purgeable_zone();
+    /* Bind cache entry allocations to the default malloc zone */
+    cache->memory_zone = malloc_default_zone();
 
     /* Size initial hash tables with at least 256 buckets to avoid early rehashing churn */
     initial_hint = 256;

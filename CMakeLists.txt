@@ -11,7 +11,7 @@ set(VERSION "1000" CACHE STRING "Library version")
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -mmacosx-version-min=11.0 -fapplication-extension")
 if(DEBUG)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fsanitize=address -DDEBUG=1")
 else()
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
 endif()

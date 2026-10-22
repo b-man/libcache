@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <malloc/malloc.h>
 
 #include <cache.h>
 #include <cache_callbacks.h>
@@ -170,10 +171,10 @@ test_value_purgeable_and_release_callbacks(void)
 {
     void *context = NULL;
     void *heap_value = malloc(128);
-    void *purgeable_buf = malloc(4096);
+    void *purgeable_buf = malloc_zone_malloc(malloc_default_purgeable_zone(), 4096);
 
     ASSERT_TRUE(heap_value != NULL && purgeable_buf != NULL,
-        "Sample heap allocations must succeed");
+        "Sample heap and purgeable allocations must succeed");
 
     /* Positive Path: Default free callback releases key_or_value allocation cleanly */
     cache_release_cb_free(heap_value, context);
