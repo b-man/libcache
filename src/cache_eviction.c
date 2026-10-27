@@ -226,7 +226,7 @@ cache_init_memory_pressure_monitor(cache_t *cache)
         cache->mem_pressure_source = dispatch_source_create(
             DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,
             0,
-            DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+            DISPATCH_MEMORYPRESSURE_NORMAL | DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
             cache->monitor_queue
         );
         cache->sim_pressure_source = dispatch_source_create(
